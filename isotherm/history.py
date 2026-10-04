@@ -176,14 +176,17 @@ def _store_candles(conn, ticker, candles) -> int:
     return len(candles)
 
 
-def backfill_candles(conn, since: date, limit: int | None = None) -> int:
+def backfill_candles(conn, since: date, limit: int | None = None, retry_empty: bool = False) -> int:
+    """Fetch hourly candles for settled markets. A market whose fetch returned zero candles is
+    recorded with n=0 and skipped on later runs; pass retry_empty=True to fetch those again
+    (an empty response can be transient, not proof the market never traded)."""
     cutoff = get_json(config.KALSHI_API + "/historical/cutoff").get("market_settled_ts")
     rows = conn.execute(
         """SELECT m.ticker, m.series_ticker, m.target_date, m.close_time, st.tz
            FROM markets m JOIN series s USING(series_ticker) JOIN stations st USING(station_id)
            WHERE m.target_date >= ? AND m.result IS NOT NULL
-             AND m.ticker NOT IN (SELECT ticker FROM candles_done)
-           ORDER BY m.target_date DESC""", (since.isoformat(),)).fetchall()
+             AND m.ticker NOT IN (SELECT ticker FROM candles_done WHERE n > 0 OR NOT ?)
+           ORDER BY m.target_date DESC""", (since.isoformat(), retry_empty)).fetchall()
     if limit:
         rows = rows[:limit]
     log.info("candles: %d markets to fetch", len(rows))

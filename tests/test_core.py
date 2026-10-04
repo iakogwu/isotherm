@@ -69,3 +69,41 @@ def test_blend_recovers_known_weights():
                        "y": (rng.random(n) < p_true).astype(int)})
     b = evaluate.fit_blend(df)
     assert abs(b[1] - 0.9) < 0.1 and abs(b[2] - 0.3) < 0.1
+
+
+def _candle_db():
+    import sqlite3
+    from isotherm import db
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(db.SCHEMA)
+    db._migrate(conn)
+    conn.execute("INSERT INTO stations(station_id, cli_code, tz) VALUES ('KNYC', 'CLINYC', 'America/New_York')")
+    conn.execute("INSERT INTO series(series_ticker, kind, station_id) VALUES ('KXHIGHNY', 'high', 'KNYC')")
+    for t in ("A", "B"):
+        conn.execute("""INSERT INTO markets(ticker, event_ticker, series_ticker, target_date, result)
+                        VALUES (?, 'KXHIGHNY-26SEP01', 'KXHIGHNY', '2026-09-01', 'no')""", (t,))
+    return conn
+
+
+def test_empty_candle_fetch_is_retried_only_on_request(monkeypatch):
+    from isotherm import history
+    calls = []
+
+    def fake_get_json(url, params=None, pause=None):
+        if url.endswith("/historical/cutoff"):
+            return {"market_settled_ts": None}
+        calls.append(url.split("/markets/")[1].split("/")[0])
+        return {"candlesticks": []}   # transient empty response
+
+    monkeypatch.setattr(history, "get_json", fake_get_json)
+    conn = _candle_db()
+    history.backfill_candles(conn, date(2026, 1, 1))
+    assert sorted(calls) == ["A", "B"]
+    assert conn.execute("SELECT COUNT(*) FROM candles_done WHERE n = 0").fetchall()[0][0] == 2
+
+    calls.clear()
+    history.backfill_candles(conn, date(2026, 1, 1))             # default: empties stay skipped
+    assert calls == []
+    history.backfill_candles(conn, date(2026, 1, 1), retry_empty=True)
+    assert sorted(calls) == ["A", "B"]

@@ -120,6 +120,8 @@ def main(argv=None) -> int:
     h = sub.add_parser("backfill-history", help="Phase 2/3 history (resumable; slow)")
     h.add_argument("--since", default="2024-02-01")
     h.add_argument("--step", choices=("all", "markets", "forecasts", "nbs", "candles"), default="all")
+    h.add_argument("--retry-empty", action="store_true",
+                   help="candles: re-fetch markets whose earlier fetch returned no candles")
     o = sub.add_parser("backfill-outcomes", help="load recently settled Kalshi results")
     o.add_argument("--days", type=int, default=30)
     ev = sub.add_parser("evaluate", help="Phase 2 skill + Phase 3 backtest report")
@@ -145,7 +147,10 @@ def main(argv=None) -> int:
         step = {"all": history.run_all, "markets": history.backfill_markets,
                 "forecasts": history.backfill_forecasts, "nbs": history.backfill_nbs,
                 "candles": history.backfill_candles}[args.step]
-        step(conn, since)
+        if args.step == "candles":
+            history.backfill_candles(conn, since, retry_empty=args.retry_empty)
+        else:
+            step(conn, since)
         return 0
     if args.cmd == "paper-report":
         print(paper.report(conn))
