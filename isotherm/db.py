@@ -175,6 +175,22 @@ CREATE TABLE IF NOT EXISTS paper_predictions (
     PRIMARY KEY (ticker, horizon)
 );
 
+-- One row per (station, day, horizon, kind) decision, including the ones that could not be
+-- recorded, so a missed hour shows up as a gap rather than silently using a later price.
+CREATE TABLE IF NOT EXISTS paper_decisions (
+    station_id      TEXT NOT NULL,
+    target_date     TEXT NOT NULL,
+    horizon         TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    decision_ts     TEXT NOT NULL,
+    status          TEXT NOT NULL,         -- recorded | missed_quote | no_prediction | error
+    detail          TEXT,
+    contracts       INTEGER,
+    blend_hash      TEXT,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (station_id, target_date, horizon, kind)
+);
+
 CREATE TABLE IF NOT EXISTS job_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     job             TEXT NOT NULL,
@@ -211,6 +227,11 @@ def _migrate(conn):
     if "p_trade" not in pcols:
         conn.execute("ALTER TABLE paper_predictions ADD COLUMN p_trade REAL")   # v2 blend probability
         conn.commit()
+    for col, typ in (("quote_ts", "TEXT"), ("yes_bid_size", "REAL"), ("yes_ask_size", "REAL"),
+                     ("blend_hash", "TEXT")):
+        if col not in pcols:
+            conn.execute(f"ALTER TABLE paper_predictions ADD COLUMN {col} {typ}")
+            conn.commit()
 
 
 def last_success(conn, job: str):

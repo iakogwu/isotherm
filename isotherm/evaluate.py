@@ -233,6 +233,55 @@ BLEND_FILE = REPORT_DIR / "blend.json"
 MIN_BLEND_FIT = 2000
 
 
+def config_fingerprint() -> dict:
+    """Every setting that changes what the frozen blend means. paper.py refuses a blend.json
+    whose hash doesn't match the running code, so a tweak can't silently reuse old weights."""
+    return {"model_version": model.VERSION, "params": model.DEFAULTS, "tail_df": model.TAIL_DF,
+            "sigma_scale": model.SIGMA_SCALE, "holdout_start": HOLDOUT_START,
+            "contracts_per_order": CONTRACTS_PER_ORDER, "price_range": list(PRICE_RANGE),
+            "quote_max_age_h": QUOTE_MAX_AGE_H, "min_blend_fit": MIN_BLEND_FIT,
+            "thresholds_swept": list(THRESHOLDS)}
+
+
+def config_hash() -> str:
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps(config_fingerprint(), sort_keys=True).encode()).hexdigest()[:12]
+
+
+def _git_commit() -> str:
+    import subprocess
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=config.ROOT, capture_output=True,
+                              text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--", "isotherm"], cwd=config.ROOT,
+                               capture_output=True, text=True, check=True).stdout.strip()
+        return head + ("-dirty" if dirty else "")
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _freeze_blend(coefs, chosen) -> str:
+    """Write blend.json once, read-only. Later runs save a dated candidate instead, so the
+    weights paper trading uses can't be replaced by re-running evaluate."""
+    import json
+    import os
+    import stat
+    from datetime import datetime, timezone
+    doc = {"model_version": model.VERSION, "config_hash": config_hash(), "config": config_fingerprint(),
+           "git_commit": _git_commit(), "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           "fit_on": f"dev < {HOLDOUT_START}", "coefs": coefs, "thresholds": chosen}
+    text = json.dumps(doc, indent=2)
+    if BLEND_FILE.exists():
+        cand = REPORT_DIR / f"blend_candidate_{doc['created_at'][:19].replace(':', '')}.json"
+        cand.write_text(text)
+        return (f"blend.json is already frozen and was NOT changed. This run's fit is in {cand.name}. "
+                "To replace the frozen blend, delete blend.json deliberately and re-run.")
+    BLEND_FILE.write_text(text)
+    os.chmod(BLEND_FILE, stat.S_IREAD)
+    return f"Froze blend.json (config {doc['config_hash']}, commit {doc['git_commit']})."
+
+
 def add_blend(con: pd.DataFrame):
     """Fit the market+model blend per horizon on DEV quotes only; add p_blend to quoted rows."""
     q = quoted(con)
@@ -287,8 +336,7 @@ def _strategy(con, col, label):
 
 
 def phase3(con: pd.DataFrame) -> str:
-    import json
-    out = ["PHASE 3 - paper backtest. Buy YES at the ask or NO at (1 - bid), taker fees, "
+    out =["PHASE 3 - paper backtest. Buy YES at the ask or NO at (1 - bid), taker fees, "
            f"{CONTRACTS_PER_ORDER}-contract orders, 1 decision per contract per horizon.",
            "Fills assume the quoted price was available for the size; real fills will be worse.", ""]
     con, coefs = add_blend(con)
@@ -314,8 +362,7 @@ def phase3(con: pd.DataFrame) -> str:
     out += ["[v2] HOLDOUT accuracy: does the blend beat the market price itself?", _fmt(pd.DataFrame(rows)), ""]
     lines, chosen = _strategy(con, "p_blend", "v2 market+model blend")
     out += lines
-    BLEND_FILE.write_text(json.dumps({"model_version": model.VERSION, "fit_on": f"dev < {HOLDOUT_START}",
-                                      "coefs": coefs, "thresholds": chosen}, indent=2))
+    out += [_freeze_blend(coefs, chosen), ""]
     return "\n".join(out)
 
 

@@ -107,3 +107,107 @@ def test_empty_candle_fetch_is_retried_only_on_request(monkeypatch):
     assert calls == []
     history.backfill_candles(conn, date(2026, 1, 1), retry_empty=True)
     assert sorted(calls) == ["A", "B"]
+
+
+def _paper_db():
+    conn = _candle_db()   # KNYC high market tickers A, B for 2026-09-01
+    conn.execute("UPDATE markets SET strike_type='greater', floor_strike=80 WHERE ticker='A'")
+    conn.execute("UPDATE markets SET strike_type='less', cap_strike=81 WHERE ticker='B'")
+    return conn
+
+
+def _snap(conn, ticker, ts, bid=0.40, ask=0.45):
+    conn.execute("INSERT INTO market_snapshots(ticker, ts, yes_bid, yes_ask, yes_bid_size, yes_ask_size) "
+                 "VALUES (?,?,?,?,10,20)", (ticker, ts, bid, ask))
+
+
+def test_paper_quote_must_be_near_decision():
+    from datetime import datetime, timezone
+    from isotherm import paper
+    conn = _paper_db()
+    dec = datetime(2026, 9, 1, 4, 0, tzinfo=timezone.utc)
+    _snap(conn, "A", "2026-09-01T03:20:00+00:00", 0.10, 0.12)   # 40 min early: too stale
+    _snap(conn, "A", "2026-09-01T04:07:00+00:00")                # 7 min late: the one to use
+    _snap(conn, "B", "2026-09-01T06:07:00+00:00")                # 2 h late: must not be used
+    q = paper._quotes_at(conn, "KNYC", date(2026, 9, 1), dec)
+    assert list(q["ticker"]) == ["A"]
+    assert q.iloc[0]["quote_ts"] == "2026-09-01T04:07:00+00:00" and q.iloc[0]["yes_ask_size"] == 20
+
+
+def _fake_inputs(monkeypatch, paper):
+    import pandas as pd
+    monkeypatch.setattr(paper.features, "fetch_prev_runs", lambda *a, **k: None)
+    monkeypatch.setattr(paper.history, "store_prev_runs", lambda *a, **k: None)
+    monkeypatch.setattr(paper.history, "fetch_nbs", lambda *a, **k: 0)
+    monkeypatch.setattr(paper.model, "build_dataset", lambda *a, **k: None)
+    monkeypatch.setattr(paper.model, "fit_predict", lambda *a, **k: pd.DataFrame(
+        [{"kind": "high", "mu": 80.0, "sigma": 2.0, "nbs": 80.0, "nbs_sd": 2.0}]))
+
+
+def test_paper_records_missed_decision_instead_of_late_price(monkeypatch):
+    from datetime import datetime, timezone
+    from isotherm import paper
+    _fake_inputs(monkeypatch, paper)
+    conn = _paper_db()
+    st = conn.execute("SELECT * FROM stations").fetchone()
+    dec = datetime(2026, 9, 1, 4, 0, tzinfo=timezone.utc)
+    _snap(conn, "A", "2026-09-01T06:07:00+00:00")   # the hourly run was two hours late
+    assert paper._record(conn, st, date(2026, 9, 1), "eve", dec, ["high"], None) == 0
+    assert conn.execute("SELECT status FROM paper_decisions").fetchall()[0][0] == "missed_quote"
+    assert conn.execute("SELECT COUNT(*) FROM paper_predictions").fetchall()[0][0] == 0
+
+    _snap(conn, "A", "2026-09-01T04:07:00+00:00")
+    _snap(conn, "B", "2026-09-01T04:07:00+00:00")
+    conn.execute("DELETE FROM paper_decisions")
+    assert paper._record(conn, st, date(2026, 9, 1), "eve", dec, ["high"], None) == 2
+    row = conn.execute("SELECT quote_ts, yes_bid_size, yes_ask_size FROM paper_predictions LIMIT 1").fetchone()
+    assert tuple(row) == ("2026-09-01T04:07:00+00:00", 10.0, 20.0)
+    assert conn.execute("SELECT status, contracts FROM paper_decisions").fetchall()[0][:] == ("recorded", 2)
+
+
+def test_paper_one_station_failing_does_not_stop_others(monkeypatch):
+    from datetime import datetime, timezone
+    from isotherm import paper
+    conn = _paper_db()
+    conn.execute("INSERT INTO stations(station_id, cli_code, tz) VALUES ('KMDW', 'CLIMDW', 'America/Chicago')")
+    conn.execute("INSERT INTO series(series_ticker, kind, station_id) VALUES ('KXHIGHCHI', 'high', 'KMDW')")
+    conn.commit()   # run() rolls back a failed station's work; setup rows must survive that
+    dec = datetime(2026, 9, 1, 4, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(paper, "ENABLED", True)
+    monkeypatch.setattr(paper, "_load_blend", lambda: (None, "test"))
+    monkeypatch.setattr(paper, "_due", lambda conn, now: [
+        (s, date(2026, 9, 1), "eve", dec) for s in conn.execute("SELECT * FROM stations ORDER BY station_id")])
+
+    def fake_record(conn, st, d, hz, dec, kinds, blend):
+        if st["station_id"] == "KMDW":
+            raise ConnectionError("network down")
+        for k in kinds:
+            paper._mark(conn, st, d, hz, k, dec, "recorded", contracts=1)
+        return 1
+
+    monkeypatch.setattr(paper, "_record", fake_record)
+    paper.run(conn)
+    got = dict(conn.execute("SELECT station_id, status FROM paper_decisions").fetchall())
+    assert got == {"KMDW": "error", "KNYC": "recorded"}
+    paper.run(conn)   # nothing is retried or double-recorded
+    assert conn.execute("SELECT COUNT(*) FROM paper_decisions").fetchall()[0][0] == 2
+
+
+def test_blend_file_is_frozen_and_version_checked(monkeypatch, tmp_path):
+    import json
+    from isotherm import paper
+    monkeypatch.setattr(evaluate, "REPORT_DIR", tmp_path)
+    monkeypatch.setattr(evaluate, "BLEND_FILE", tmp_path / "blend.json")
+    coefs = {"eve": {"b0": 0.1, "b_market": 0.95, "b_model": 0.2, "n_dev": 3000}}
+    assert "Froze" in evaluate._freeze_blend(coefs, {"eve": 0.04})
+    first = (tmp_path / "blend.json").read_text()
+    assert "NOT changed" in evaluate._freeze_blend({"eve": {**coefs["eve"], "b_model": 9.9}}, {"eve": 0.0})
+    assert (tmp_path / "blend.json").read_text() == first
+    assert len(list(tmp_path.glob("blend_candidate_*.json"))) == 1
+
+    blend, why = paper._load_blend()
+    assert blend is not None and why == "ok"
+    monkeypatch.setattr(evaluate.model, "SIGMA_SCALE", 1.0)   # code changed after the freeze
+    blend, why = paper._load_blend()
+    assert blend is None and "config" in why
+    assert json.loads(first)["config_hash"] != evaluate.config_hash()
