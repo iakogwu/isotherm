@@ -3,9 +3,15 @@
     python -m isotherm evaluate
 
 Split discipline:
-  DEV      target dates before HOLDOUT_START: free to look at, tune, iterate.
-  HOLDOUT  HOLDOUT_START onward: reported only at settings chosen on DEV.
-  FORWARD  paper_predictions logged live by the scheduler. The final word.
+  DEV         target dates before HOLDOUT_START. The blend is fit on the earlier part of DEV
+              and its trading threshold chosen on the later part (BLEND_TUNE_FRAC), so the
+              threshold is never picked on the same contracts the weights were fit on.
+  VALIDATION  HOLDOUT_START onward. Reported at DEV-chosen settings, but it has been looked at
+              while the model was built (2026-10-04 audit), so it is not a clean holdout.
+  FORWARD     paper_predictions logged live by the scheduler. The only clean test.
+
+Uncertainty is clustered by calendar date: brackets of one event are mutually exclusive and
+weather errors are correlated across cities on the same day, so contracts are not independent.
 """
 import math
 import re
@@ -34,7 +40,7 @@ def taker_fee(price, contracts=CONTRACTS_PER_ORDER, multiplier=1.0):
 
 
 def split_of(d):
-    return np.where(pd.Series(d).astype(str) < HOLDOUT_START, "dev", "holdout")
+    return np.where(pd.Series(d).astype(str) < HOLDOUT_START, "dev", "validation")
 
 
 # ------------------------------------------------------------------ data assembly
@@ -106,15 +112,16 @@ def _fmt(df):
 def phase2(preds: pd.DataFrame, con: pd.DataFrame) -> str:
     out = ["PHASE 2 - forecast skill (lower is better). Model vs NBS (NWS's own blend).", ""]
     p = preds.dropna(subset=["obs"]).copy()
-    p["crps_model"] = model.crps_gaussian(p["mu"], p["sigma"], p["obs"])
+    # score the distribution that is traded (Student-t, scaled sigma), for model and NBS alike
+    p["crps_model"] = model.crps_traded(p["mu"], p["sigma"], p["obs"])
     has = p["nbs"].notna()
     p["crps_nbs"] = np.nan
-    p.loc[has, "crps_nbs"] = model.crps_gaussian(
+    p.loc[has, "crps_nbs"] = model.crps_traded(
         p.loc[has, "nbs"], np.maximum(p.loc[has, "nbs_sd"].fillna(2.0), 0.7), p.loc[has, "obs"])
     p["ae_model"] = (p["mu"] - p["obs"]).abs()
     p["ae_nbs"] = (p["nbs"] - p["obs"]).abs()
     z = (p["obs"] - p["mu"]) / p["sigma"]
-    p["in80"] = (z.abs() <= 1.2816).astype(float)
+    p["in80"] = (z.abs() <= model.central_z(0.8)).astype(float)
     pb = p[has]
     g = pb.groupby(["split", "horizon", "kind"]).agg(
         days=("obs", "size"), mae_model=("ae_model", "mean"), mae_nbs=("ae_nbs", "mean"),
@@ -145,10 +152,10 @@ def phase2(preds: pd.DataFrame, con: pd.DataFrame) -> str:
         mean_mkt=("p_mkt", "mean")).reset_index()
     out += ["Calibration of model probabilities (freq should track mean_p):", _fmt(ct), ""]
 
-    st = pb[pb["split"] == "holdout"].groupby(["station_id", "kind"]).agg(
+    st = pb[pb["split"] == "validation"].groupby(["station_id", "kind"]).agg(
         days=("obs", "size"), crps_model=("crps_model", "mean"), crps_nbs=("crps_nbs", "mean")).reset_index()
     st["skill"] = 1 - st["crps_model"] / st["crps_nbs"]
-    out += ["HOLDOUT skill vs NBS by station (positive = model better):",
+    out += ["VALIDATION skill vs NBS by station (positive = model better):",
             _fmt(st.sort_values("skill", ascending=False)), ""]
     return "\n".join(out)
 
@@ -207,17 +214,21 @@ def trades(con: pd.DataFrame, threshold: float, col: str = "p_model") -> pd.Data
     return q
 
 
-def _boot_ci(t: pd.DataFrame, n_boot=2000, seed=7):
-    """90% CI for mean PnL/contract, resampling whole (station, day) clusters - bets on the
-    same day and city are correlated, so contract-level resampling would overstate certainty."""
-    if t.empty:
+def _date_boot(df: pd.DataFrame, col: str, n_boot=2000, seed=7):
+    """90% CI for the mean of `col`, resampling whole calendar dates: one day's weather moves
+    every city and every bracket together, so resampling contracts would overstate certainty."""
+    if df.empty:
         return (np.nan, np.nan)
-    g = t.groupby(["station_id", "target_date"])["pnl"].agg(["sum", "size"])
+    g = df.groupby("target_date")[col].agg(["sum", "size"])
     s, n = g["sum"].to_numpy(), g["size"].to_numpy()
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, len(g), size=(n_boot, len(g)))
     means = s[idx].sum(1) / n[idx].sum(1)
     return tuple(np.percentile(means, [5, 95]))
+
+
+def _boot_ci(t: pd.DataFrame, n_boot=2000, seed=7):
+    return _date_boot(t, "pnl", n_boot, seed)
 
 
 def _summ(t):
@@ -231,6 +242,7 @@ def _summ(t):
 
 BLEND_FILE = REPORT_DIR / "blend.json"
 MIN_BLEND_FIT = 2000
+BLEND_TUNE_FRAC = 0.3   # latest 30% of DEV dates: threshold choice only, never blend fitting
 
 
 def config_fingerprint() -> dict:
@@ -240,6 +252,7 @@ def config_fingerprint() -> dict:
             "sigma_scale": model.SIGMA_SCALE, "holdout_start": HOLDOUT_START,
             "contracts_per_order": CONTRACTS_PER_ORDER, "price_range": list(PRICE_RANGE),
             "quote_max_age_h": QUOTE_MAX_AGE_H, "min_blend_fit": MIN_BLEND_FIT,
+            "blend_tune_frac": BLEND_TUNE_FRAC,
             "thresholds_swept": list(THRESHOLDS)}
 
 
@@ -270,7 +283,7 @@ def _freeze_blend(coefs, chosen) -> str:
     from datetime import datetime, timezone
     doc = {"model_version": model.VERSION, "config_hash": config_hash(), "config": config_fingerprint(),
            "git_commit": _git_commit(), "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-           "fit_on": f"dev < {HOLDOUT_START}", "coefs": coefs, "thresholds": chosen}
+           "fit_on": "earlier DEV dates (see coefs fit_dates); threshold on later DEV dates", "coefs": coefs, "thresholds": chosen}
     text = json.dumps(doc, indent=2)
     if BLEND_FILE.exists():
         cand = REPORT_DIR / f"blend_candidate_{doc['created_at'][:19].replace(':', '')}.json"
@@ -282,29 +295,98 @@ def _freeze_blend(coefs, chosen) -> str:
     return f"Froze blend.json (config {doc['config_hash']}, commit {doc['git_commit']})."
 
 
+def dev_parts(con: pd.DataFrame) -> pd.Series:
+    """'fit' for the earlier DEV dates, 'tune' for the latest BLEND_TUNE_FRAC of them (by dates
+    that have quotes), None outside DEV."""
+    td = con["target_date"].astype(str)
+    dev = con["split"] == "dev"
+    dates = np.sort(td[dev & con["yes_ask"].notna()].unique())
+    if len(dates) == 0:
+        return pd.Series(None, index=con.index, dtype=object)
+    cut = dates[int(len(dates) * (1 - BLEND_TUNE_FRAC))]
+    return pd.Series(np.where(~dev, None, np.where(td < cut, "fit", "tune")), index=con.index)
+
+
+def _coef_ci(q: pd.DataFrame, n_boot=200, seed=11):
+    """90% CI for each blend coefficient, refitting on calendar dates resampled with replacement."""
+    groups = list(q.groupby("target_date").indices.values())
+    rng = np.random.default_rng(seed)
+    bs = []
+    for _ in range(n_boot):
+        pick = rng.integers(0, len(groups), len(groups))
+        bs.append(fit_blend(q.iloc[np.concatenate([groups[i] for i in pick])]))
+    return np.percentile(np.array(bs), [5, 95], axis=0)
+
+
 def add_blend(con: pd.DataFrame):
-    """Fit the market+model blend per horizon on DEV quotes only; add p_blend to quoted rows."""
-    q = quoted(con)
+    """Fit the market+model blend per horizon on the earlier DEV dates only; add p_blend to
+    every quoted row (the later DEV dates and VALIDATION are out of sample for it)."""
     con = con.copy()
+    con["dev_part"] = dev_parts(con)
+    q = quoted(con)
     con["p_mkt"] = np.nan
     con.loc[q.index, "p_mkt"] = q["p_mkt"]
     con["p_blend"] = np.nan
     coefs = {}
     for hz in ("open", "eve"):
-        dev = q[(q["split"] == "dev") & (q["horizon"] == hz)]
-        if len(dev) < MIN_BLEND_FIT:
+        fit = q[(q["dev_part"] == "fit") & (q["horizon"] == hz)]
+        if len(fit) < MIN_BLEND_FIT:
             continue
-        b = fit_blend(dev)
-        coefs[hz] = {"b0": b[0], "b_market": b[1], "b_model": b[2], "n_dev": len(dev)}
+        b = fit_blend(fit)
+        lo, hi = _coef_ci(fit)
+        coefs[hz] = {"b0": b[0], "b_market": b[1], "b_model": b[2],
+                     "b_model_ci90": [lo[2], hi[2]], "b_market_ci90": [lo[1], hi[1]],
+                     "n_contracts": len(fit), "n_events": int(fit["event_ticker"].nunique()),
+                     "n_dates": int(fit["target_date"].nunique()),
+                     "fit_dates": [str(fit["target_date"].min()), str(fit["target_date"].max())]}
         rows = q[q["horizon"] == hz]
         con.loc[rows.index, "p_blend"] = apply_blend(rows, b)
     return con, coefs
 
 
-def _strategy(con, col, label):
+def event_scores(con: pd.DataFrame, cols) -> pd.DataFrame:
+    """One row per (event, horizon) whose every bracket had a quote and exactly one settled YES.
+    Each column's bracket probabilities are renormalised to sum to 1 across the event, then
+    scored as one multiclass forecast: log score (-log p of the winner) and multiclass Brier."""
+    q = con.loc[quoted(con).index].dropna(subset=list(cols))   # keep the columns as given
+    n_all = con.groupby(["event_ticker", "horizon"]).size().rename("n_all")
+    q = q.join(n_all, on=["event_ticker", "horizon"])
+    g = q.groupby(["event_ticker", "horizon"])
+    q = q[(g["ticker"].transform("size") == q["n_all"]) & (g["y"].transform("sum") == 1)].copy()
+    if q.empty:
+        return pd.DataFrame()
+    out = q.groupby(["event_ticker", "horizon"]).agg(
+        target_date=("target_date", "first"), split=("split", "first"),
+        dev_part=("dev_part", "first")).reset_index()
+    for c in cols:
+        pn = q[c] / q.groupby(["event_ticker", "horizon"])[c].transform("sum")
+        q["_ls"] = np.where(q["y"] == 1, -np.log(np.clip(pn, 1e-4, 1)), 0.0)
+        q["_br"] = (pn - q["y"]) ** 2
+        agg = q.groupby(["event_ticker", "horizon"]).agg(ls=("_ls", "sum"), br=("_br", "sum")).reset_index()
+        out = out.merge(agg.rename(columns={"ls": f"ls_{c}", "br": f"brier_{c}"}),
+                        on=["event_ticker", "horizon"])
+    return out
+
+
+def _event_table(ev: pd.DataFrame, label_col: str) -> pd.DataFrame:
+    rows = []
+    for (part, hz), g in ev.groupby([label_col, "horizon"]):
+        g = g.assign(d_ls=g["ls_p_blend"] - g["ls_p_mkt"])
+        lo, hi = _date_boot(g, "d_ls")
+        rows.append({"part": part, "horizon": hz, "events": len(g), "dates": g["target_date"].nunique(),
+                     "logscore_market": g["ls_p_mkt"].mean(), "logscore_model": g["ls_p_model"].mean(),
+                     "logscore_blend": g["ls_p_blend"].mean(), "blend_minus_market": g["d_ls"].mean(),
+                     "ci90_lo": lo, "ci90_hi": hi,
+                     "brier_market": g["brier_p_mkt"].mean(), "brier_blend": g["brier_p_blend"].mean()})
+    return pd.DataFrame(rows)
+
+
+def _strategy(con, col, label, pick=None, pick_label="DEV"):
+    """Sweep thresholds on the `pick` rows (default: all DEV), report VALIDATION at the choice."""
+    pick = (con["split"] == "dev") if pick is None else pick
     out, rows, chosen = [], [], {}
     for hz in ("open", "eve"):
-        dev = con[(con["split"] == "dev") & (con["horizon"] == hz)]
+        dev = con[pick & (con["horizon"] == hz)]
         best = None
         for th in THRESHOLDS:
             r = dict(horizon=hz, threshold=th, **_summ(trades(dev, th, col)))
@@ -312,15 +394,16 @@ def _strategy(con, col, label):
             if r["trades"] >= 100 and (best is None or r["pnl_per_contract"] > best[1]):
                 best = (th, r["pnl_per_contract"])
         chosen[hz] = best[0] if best else None
-    out += [f"[{label}] DEV threshold sweep (choose here, never on holdout):", _fmt(pd.DataFrame(rows)), ""]
+    out += [f"[{label}] {pick_label} threshold sweep (choose here, never on validation):",
+            _fmt(pd.DataFrame(rows)), ""]
     rows = []
     for hz, th in chosen.items():
         if th is None:
             continue
-        hold = con[(con["split"] == "holdout") & (con["horizon"] == hz)]
+        hold = con[(con["split"] == "validation") & (con["horizon"] == hz)]
         rows.append(dict(horizon=hz, threshold=th, **_summ(trades(hold, th, col))))
-    out += [f"[{label}] HOLDOUT at the DEV-chosen threshold (the honest number):",
-            _fmt(pd.DataFrame(rows)) if rows else "(not enough DEV trades to choose a threshold)", ""]
+    out += [f"[{label}] VALIDATION at the {pick_label}-chosen threshold:",
+            _fmt(pd.DataFrame(rows)) if rows else f"(not enough {pick_label} trades to choose a threshold)", ""]
     allt = [trades(con[con["horizon"] == hz], th, col) for hz, th in chosen.items() if th is not None]
     allt = pd.concat(allt) if allt else pd.DataFrame()
     if not allt.empty:
@@ -341,26 +424,44 @@ def phase3(con: pd.DataFrame) -> str:
            "Fills assume the quoted price was available for the size; real fills will be worse.", ""]
     con, coefs = add_blend(con)
     q = quoted(con)
-    out += [f"Quoted contracts: dev={int((q['split'] == 'dev').sum())}  holdout={int((q['split'] == 'holdout').sum())}", ""]
+    out += [f"Quoted contracts: dev fit={int((q['dev_part'] == 'fit').sum())}  "
+            f"dev tune={int((q['dev_part'] == 'tune').sum())}  "
+            f"validation={int((q['split'] == 'validation').sum())}",
+            "P&L confidence intervals resample whole calendar dates.", ""]
 
     lines, _ = _strategy(con, "p_model", "v1 model alone")
     out += lines
     if not coefs:
-        out += [f"[v2 market+model blend] pending: needs >= {MIN_BLEND_FIT} DEV quotes per horizon "
-                "(older Kalshi price history still downloading).", ""]
+        out += [f"[v2 market+model blend] pending: needs >= {MIN_BLEND_FIT} quotes per horizon "
+                "on the earlier DEV dates.", ""]
         return "\n".join(out)
 
-    out += ["[v2 market+model blend] coefficients fit on DEV (logit scale):",
-            _fmt(pd.DataFrame([dict(horizon=h, **c) for h, c in coefs.items()])), ""]
-    hb = q[(q["split"] == "holdout") & q["p_blend"].notna()]
+    ct = pd.DataFrame([{"horizon": h, "b0": c["b0"], "b_market": c["b_market"],
+                        "b_market_lo": c["b_market_ci90"][0], "b_market_hi": c["b_market_ci90"][1],
+                        "b_model": c["b_model"], "b_model_lo": c["b_model_ci90"][0],
+                        "b_model_hi": c["b_model_ci90"][1], "contracts": c["n_contracts"],
+                        "events": c["n_events"], "dates": c["n_dates"]} for h, c in coefs.items()])
+    out += ["[v2 market+model blend] coefficients fit on the earlier DEV dates (logit scale),",
+            "90% CI from resampling dates. b_model's CI excluding 0 = the model adds information:",
+            _fmt(ct), ""]
     rows = []
-    for hz, g in hb.groupby("horizon"):
+    for (part, hz), g in q[q["p_blend"].notna() & (q["dev_part"] != "fit")].assign(
+            part=lambda d: d["dev_part"].fillna(d["split"])).groupby(["part", "horizon"]):
         y = g["y"].to_numpy()
-        rows.append({"horizon": hz, "contracts": len(g), "brier_market": _brier(g["p_mkt"], y),
+        rows.append({"part": part, "horizon": hz, "contracts": len(g), "events": g["event_ticker"].nunique(),
+                     "dates": g["target_date"].nunique(), "brier_market": _brier(g["p_mkt"], y),
                      "brier_blend": _brier(g["p_blend"], y), "logloss_market": _logloss(g["p_mkt"], y),
                      "logloss_blend": _logloss(g["p_blend"], y)})
-    out += ["[v2] HOLDOUT accuracy: does the blend beat the market price itself?", _fmt(pd.DataFrame(rows)), ""]
-    lines, chosen = _strategy(con, "p_blend", "v2 market+model blend")
+    out += ["[v2] Per contract, out of sample for the blend weights (tune = later DEV dates):",
+            _fmt(pd.DataFrame(rows)), ""]
+    ev = event_scores(con[con["dev_part"] != "fit"], ["p_mkt", "p_model", "p_blend"])
+    if not ev.empty:
+        ev["part"] = ev["dev_part"].fillna(ev["split"])
+        out += ["[v2] Per event (all brackets quoted, renormalised to sum to 1). blend_minus_market < 0",
+                "with ci90_hi < 0 = the blend beats the market price; CI resamples whole dates:",
+                _fmt(_event_table(ev, "part")), ""]
+    lines, chosen = _strategy(con, "p_blend", "v2 market+model blend",
+                              pick=con["dev_part"] == "tune", pick_label="DEV tune")
     out += lines
     out += [_freeze_blend(coefs, chosen), ""]
     return "\n".join(out)
@@ -383,7 +484,8 @@ def run(conn, params=None, reuse=False) -> str:
     con.drop(columns=["decision"]).to_csv(REPORT_DIR / f"contracts_{stamp}.csv", index=False)
     header = (f"Isotherm evaluation  model={model.VERSION}  params={dict(model.DEFAULTS, **(params or {}))}\n"
               f"prediction rows={len(preds)}  contracts={len(con)}  "
-              f"with quotes={int(con['yes_ask'].notna().sum())}  holdout from {HOLDOUT_START}\n")
+              f"with quotes={int(con['yes_ask'].notna().sum())}  validation from {HOLDOUT_START} "
+              "(inspected during development; forward paper trading is the clean test)\n")
     text = header + "\n" + phase2(preds, con) + "\n" + phase3(con)
     (REPORT_DIR / f"report_{stamp}.txt").write_text(text, encoding="utf-8")
     return text

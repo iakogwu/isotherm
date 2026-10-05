@@ -188,3 +188,23 @@ def prob_in(mu, sigma, lo, hi):
 def crps_gaussian(mu, sigma, y):
     z = (y - mu) / sigma
     return sigma * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / math.sqrt(math.pi))
+
+
+def crps_traded(mu, sigma, y):
+    """CRPS of the distribution bracket probabilities actually use: Student-t(TAIL_DF) at
+    sigma * SIGMA_SCALE (closed form, Jordan et al. 2019, scoringRules)."""
+    from scipy.special import beta
+    s = np.asarray(sigma, float) * SIGMA_SCALE
+    if not TAIL_DF:
+        return crps_gaussian(mu, s, y)
+    v = TAIL_DF
+    z = (np.asarray(y, float) - np.asarray(mu, float)) / s
+    return s * (z * (2 * student_t.cdf(z, v) - 1)
+                + 2 * student_t.pdf(z, v) * (v + z ** 2) / (v - 1)
+                - 2 * math.sqrt(v) * beta(0.5, v - 0.5) / ((v - 1) * beta(0.5, v / 2) ** 2))
+
+
+def central_z(level=0.8):
+    """Half-width, in units of sigma, of the traded distribution's central `level` interval."""
+    q = (1 + level) / 2
+    return SIGMA_SCALE * (student_t.ppf(q, TAIL_DF) if TAIL_DF else norm.ppf(q))

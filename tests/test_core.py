@@ -211,3 +211,78 @@ def test_blend_file_is_frozen_and_version_checked(monkeypatch, tmp_path):
     blend, why = paper._load_blend()
     assert blend is None and "config" in why
     assert json.loads(first)["config_hash"] != evaluate.config_hash()
+
+
+def _synthetic_contracts(seed=3):
+    """Events of 5 mutually exclusive brackets per day and horizon; market and model are both
+    noisy views of the true probabilities, so the blend should lean on both."""
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    rows = []
+    for d in pd.date_range("2025-04-01", "2026-05-31"):
+        for hz in ("open", "eve"):
+            truth = rng.dirichlet(np.ones(5) * 2)
+            win = rng.choice(5, p=truth)
+            ev = f"KXHIGHNY-{d:%y%b%d}".upper() + hz
+            for i in range(5):
+                mid = np.clip(truth[i] + rng.normal(0, 0.05), 0.02, 0.97)
+                rows.append(dict(ticker=f"{ev}-B{i}", event_ticker=ev, target_date=d.date().isoformat(),
+                                 horizon=hz, station_id="KNYC", y=int(i == win),
+                                 yes_bid=round(mid - 0.01, 2), yes_ask=round(mid + 0.01, 2),
+                                 p_model=float(np.clip(truth[i] + rng.normal(0, 0.05), 0.01, 0.99))))
+    con = pd.DataFrame(rows)
+    con["split"] = evaluate.split_of(con["target_date"])
+    return con
+
+
+def test_blend_threshold_is_chosen_on_later_dev_dates_than_the_fit():
+    con = _synthetic_contracts()
+    part = evaluate.dev_parts(con)
+    fit_last = con.loc[part == "fit", "target_date"].max()
+    tune_first = con.loc[part == "tune", "target_date"].min()
+    assert fit_last < tune_first < evaluate.HOLDOUT_START
+    assert part[con["split"] == "validation"].isna().all()
+    share = con.loc[part == "tune", "target_date"].nunique() / con.loc[con["split"] == "dev", "target_date"].nunique()
+    assert abs(share - evaluate.BLEND_TUNE_FRAC) < 0.01
+
+
+def test_event_scores_renormalise_and_need_every_bracket_quoted():
+    con = _synthetic_contracts()
+    con["dev_part"] = evaluate.dev_parts(con)
+    con["p_mkt"] = (con["yes_bid"] + con["yes_ask"]) / 2
+    first = con["event_ticker"].iloc[0]
+    con.loc[con.index[0], ["yes_bid", "yes_ask"]] = np.nan          # one bracket unquoted
+    ev = evaluate.event_scores(con, ["p_mkt", "p_model"])
+    assert first not in set(ev["event_ticker"])
+    assert len(ev) == con["event_ticker"].nunique() - 1
+    # 0.92 on the winner, 0.02 on each of 4 others: one event, log score -log(0.92)
+    one = con[con["event_ticker"] == con["event_ticker"].iloc[10]].assign(p_mkt=lambda d: d["y"] * 0.9 + 0.02)
+    e1 = evaluate.event_scores(one, ["p_mkt"])
+    assert len(e1) == 1 and math.isclose(e1["ls_p_mkt"].iloc[0], -math.log(0.92), rel_tol=1e-9)
+
+
+def test_phase3_end_to_end_on_synthetic_data(monkeypatch, tmp_path):
+    import json
+    monkeypatch.setattr(evaluate, "REPORT_DIR", tmp_path)
+    monkeypatch.setattr(evaluate, "BLEND_FILE", tmp_path / "blend.json")
+    monkeypatch.setattr(evaluate, "MIN_BLEND_FIT", 500)
+    text = evaluate.phase3(_synthetic_contracts())
+    assert "Per event" in text and "DEV tune threshold sweep" in text and "holdout" not in text.lower()
+    blend = json.loads((tmp_path / "blend.json").read_text())
+    for hz in ("open", "eve"):
+        c = blend["coefs"][hz]
+        assert c["b_model_ci90"][0] < c["b_model"] < c["b_model_ci90"][1]
+        assert c["b_model_ci90"][0] > 0          # the synthetic model does carry information
+        assert c["fit_dates"][1] < "2026-04-01"
+
+
+def test_traded_crps_matches_numeric_integral(monkeypatch):
+    from scipy.integrate import quad
+    from scipy.stats import t as student_t
+    mu, sigma, y = 70.0, 2.5, 73.1
+    s, v = sigma * model.SIGMA_SCALE, model.TAIL_DF
+    F = lambda x: student_t.cdf((x - mu) / s, v)
+    numeric = quad(lambda x: F(x) ** 2, -np.inf, y)[0] + quad(lambda x: (1 - F(x)) ** 2, y, np.inf)[0]
+    assert math.isclose(float(model.crps_traded(mu, sigma, y)), numeric, rel_tol=1e-6)
+    # the 80% interval used for coverage is the traded distribution's, not a Gaussian's
+    assert math.isclose(student_t.cdf(model.central_z(0.8) / model.SIGMA_SCALE, v), 0.9, rel_tol=1e-9)
