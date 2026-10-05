@@ -2,7 +2,7 @@
 
     python -m isotherm run            # what the scheduler calls; each job runs only when due
     python -m isotherm run --force    # run every job now
-    python -m isotherm <job>          # discover | markets | forecasts | mos | settle | cli
+    python -m isotherm <job>          # discover | markets | forecasts | mos | settle | cli | backup
     python -m isotherm backfill-cli 2015 2026
     python -m isotherm status
     python -m isotherm peek KXHIGHNY-26OCT05
@@ -16,7 +16,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
-from . import climate, config, discover, forecasts, kalshi, mos, paper, report
+from . import backup, climate, config, discover, forecasts, kalshi, mos, paper, report
 from .db import connect, last_success, utcnow
 
 JOBS = {
@@ -30,6 +30,7 @@ JOBS = {
     "trades": kalshi.trades,
     "books": kalshi.books,
     "looks": paper.check_looks,
+    "backup": backup.run,
 }
 LOCK = config.DATA_DIR / "run.lock"
 
@@ -100,7 +101,7 @@ def cmd_run(conn, force: bool) -> int:
         ok = True
         # discover first so a fresh install has series/stations to work with
         for job in ("discover", "markets", "books", "forecasts", "mos", "settle", "cli", "paper",
-                    "trades", "looks"):
+                    "trades", "looks", "backup"):
             if force or _due(conn, job):
                 ok &= run_job(conn, job)
         return 0 if ok else 1

@@ -439,3 +439,30 @@ def test_void_or_scalar_results_still_settle_a_date(monkeypatch):
     conn.commit()
     assert paper._settled(conn)["target_date"].nunique() == 49          # date settled, just unscored
     assert paper.check_looks(conn) == 1
+
+
+def test_backup_copies_verifies_and_keeps_seven(monkeypatch, tmp_path):
+    import sqlite3
+    from isotherm import backup
+    monkeypatch.setattr(backup, "BACKUP_DIR", tmp_path / "backups")
+    src = sqlite3.connect(tmp_path / "live.db")
+    src.execute("PRAGMA journal_mode=WAL")
+    mem = _candle_db()
+    mem.commit()                        # a backup waits on an open write transaction
+    mem.backup(src)                     # file-based copy of the small test schema + rows
+    (tmp_path / "backups").mkdir()
+    for d in range(1, 10):              # nine older dated copies plus a leftover partial
+        (tmp_path / "backups" / f"isotherm-2020-01-0{d}.db").write_bytes(b"")
+    (tmp_path / "backups" / "isotherm-2020-01-09.db.part").write_bytes(b"")
+
+    assert backup.run(src) == 1
+    kept = sorted(p.name for p in (tmp_path / "backups").iterdir())
+    today = f"isotherm-{date.today().isoformat()}.db"
+    assert len(kept) == 7 and today in kept and "isotherm-2020-01-03.db" not in kept
+    copy = sqlite3.connect(tmp_path / "backups" / today)
+    assert copy.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    rows = "SELECT ticker, event_ticker, result FROM markets ORDER BY ticker"
+    assert copy.execute(rows).fetchall() == src.execute(rows).fetchall() != []
+    copy.close()
+    assert backup.run(src) == 1         # a second run the same day replaces today's copy
+    assert len(list((tmp_path / "backups").glob("*"))) == 7

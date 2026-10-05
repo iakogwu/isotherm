@@ -65,6 +65,7 @@ on and the PC is awake; gaps show up in `job_runs`, and missed paper decisions i
 ## Data
 
 `data/isotherm.db` (SQLite). Logs: `logs/isotherm.log`. Expect roughly 5–15 MB/day.
+Backups: a verified copy is made daily in `data/backups/` (7 kept); copy one off the PC now and then.
 
 Main tables: `markets`, `market_snapshots`, `ensemble_forecasts` (members as JSON),
 `deterministic_forecasts`, `mos_forecasts`, `outcomes`, `cli_reports`, `job_runs`.

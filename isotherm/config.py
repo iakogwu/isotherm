@@ -52,8 +52,9 @@ INTERVALS_MIN = {
     "cli": 12 * 60,
     "paper": 50,
     "trades": 6 * 60,
-    "books": 50,
-    "looks": 6 * 60,   # records a registered forward look once its conditions are met       # every scheduled run; only markets near a decision are fetched
+    "books": 50,       # every scheduled run; only markets near a decision are fetched
+    "looks": 6 * 60,   # records a registered forward look once its conditions are met
+    "backup": 24 * 60,
 }
 
 # Polite pacing between HTTP calls (seconds).
