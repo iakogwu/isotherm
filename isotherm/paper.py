@@ -23,7 +23,7 @@ WINDOW_AFTER_DECISION = timedelta(hours=3)
 # decision. A late or missed hourly run records a missed decision instead of trading at a
 # later price under the original timestamp.
 QUOTE_MAX_LAG = timedelta(minutes=15)
-ENABLED = False   # flipped on once history backfill + first evaluation are done
+ENABLED = True    # on since 2026-10-04, with blend.json frozen from the validation run
 
 
 def _load_blend():
