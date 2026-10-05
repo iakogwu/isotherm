@@ -195,9 +195,16 @@ MIN_COMPLETE = 0.90  # share of expected decisions actually recorded, counted fr
 
 
 def _settled(conn) -> pd.DataFrame:
-    s = pd.read_sql_query(
+    """Forward predictions on fully settled dates only. A date counts once every prediction
+    recorded for it has a final result (any result: yes, no, or a void/scalar that scoring then
+    drops), and only as part of an unbroken run from FORWARD_START, so a look can't freeze
+    while some city's events, on that date or an earlier one, are still unsettled."""
+    f = pd.read_sql_query(
         """SELECT p.*, m.result, m.target_date FROM paper_predictions p JOIN markets m USING(ticker)
-           WHERE m.result IN ('yes', 'no') AND m.target_date >= ?""", conn, params=(FORWARD_START,))
+           WHERE m.target_date >= ?""", conn, params=(FORWARD_START,))
+    done = f.groupby("target_date")["result"].apply(lambda r: r.notna().all()).sort_index()
+    prefix = done.index[:int(done.cummin().sum())] if len(done) else []
+    s = f[f["target_date"].isin(prefix) & f["result"].isin(["yes", "no"])].copy()
     s["y"] = (s["result"] == "yes").astype(int)
     return s
 

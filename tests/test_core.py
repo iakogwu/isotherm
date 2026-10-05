@@ -414,3 +414,28 @@ def test_completeness_gates_the_look_and_is_anchored_at_the_start(monkeypatch):
     assert paper.check_looks(conn) == 0                                # 78% < 90%: no look yet
     status = paper.status(conn)
     assert "Settled forward dates: 60" in status and "logscore" not in status
+
+
+def test_a_date_counts_only_once_every_prediction_on_it_has_settled(monkeypatch):
+    from isotherm import paper
+    conn, dates = _forward_db(monkeypatch, "2025-06-01", 60)
+    # one West Coast-style straggler on the 31st date hasn't settled yet
+    late = conn.execute("SELECT ticker FROM markets WHERE target_date=? LIMIT 1", (dates[30],)).fetchone()[0]
+    conn.execute("UPDATE markets SET result=NULL WHERE ticker=?", (late,))
+    conn.commit()
+    assert paper._settled(conn)["target_date"].nunique() == 30         # unbroken run stops there
+    assert "Settled forward dates: 30" in paper.status(conn)
+    assert paper.check_looks(conn) == 0                                 # 45 not reached
+    conn.execute("UPDATE markets SET result='no' WHERE ticker=?", (late,))
+    conn.commit()
+    assert paper.check_looks(conn) == 1
+    assert conn.execute("SELECT through_date FROM forward_looks").fetchone()[0] == dates[44]
+
+
+def test_void_or_scalar_results_still_settle_a_date(monkeypatch):
+    from isotherm import paper
+    conn, dates = _forward_db(monkeypatch, "2025-06-01", 50)
+    conn.execute("UPDATE markets SET result='scalar' WHERE target_date=?", (dates[3],))
+    conn.commit()
+    assert paper._settled(conn)["target_date"].nunique() == 49          # date settled, just unscored
+    assert paper.check_looks(conn) == 1

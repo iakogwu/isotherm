@@ -30,7 +30,10 @@ threshold lost about 1.4 cents per contract.
 
 ## Schedule and decisions
 
-The count is of settled forward target dates, starting 2026-10-05. Each look happens at the
+The count is of settled forward target dates, starting 2026-10-05. A date counts as settled only
+when every prediction recorded for it has a final result (yes, no, or void/scalar, which are not
+scored), and only as part of an unbroken run of settled dates from the start. So a look can never
+freeze while some city's events are still unsettled. Each look happens at the
 **first settled date** that has the required number of dates **and** at least 90% of expected
 decisions recorded from 2026-10-05 through that date. The data fixes that point, not whoever
 runs a command. Each look is computed once on data through that date, stored in the
