@@ -28,6 +28,7 @@ JOBS = {
     "cli": climate.run,
     "paper": paper.run,
     "trades": kalshi.trades,
+    "books": kalshi.books,
 }
 LOCK = config.DATA_DIR / "run.lock"
 
@@ -97,7 +98,8 @@ def cmd_run(conn, force: bool) -> int:
     try:
         ok = True
         # discover first so a fresh install has series/stations to work with
-        for job in ("discover", "markets", "forecasts", "mos", "settle", "cli", "paper", "trades"):
+        for job in ("discover", "markets", "books", "forecasts", "mos", "settle", "cli", "paper",
+                    "trades"):
             if force or _due(conn, job):
                 ok &= run_job(conn, job)
         return 0 if ok else 1

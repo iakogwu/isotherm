@@ -204,6 +204,17 @@ CREATE TABLE IF NOT EXISTS market_trades (
 );
 CREATE INDEX IF NOT EXISTS ix_market_trades_ticker_time ON market_trades(ticker, created_time);
 
+-- Full-depth order book (every price level and resting size) around each decision time: the
+-- queue a resting order would have joined. Levels are JSON [[price, size], ...] as Kalshi
+-- returns them; yes = bids to buy YES, no = bids to buy NO.
+CREATE TABLE IF NOT EXISTS order_books (
+    ticker          TEXT NOT NULL,
+    ts              TEXT NOT NULL,
+    yes_levels      TEXT,
+    no_levels       TEXT,
+    PRIMARY KEY (ticker, ts)
+);
+
 CREATE TABLE IF NOT EXISTS trades_done (
     ticker          TEXT PRIMARY KEY,
     n               INTEGER,

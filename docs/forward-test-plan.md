@@ -43,8 +43,10 @@ The period only counts if all of these hold. Otherwise extend it.
 - **At least 90% of expected decisions recorded.** Expected means 48 series × 2 horizons per day.
   A PC that is off leaves no row, so this is measured against the expected count, not the logged
   one.
-- **No code, model, threshold, station or eligibility change** during the period. Any change
-  produces a new config hash, and the clock restarts at zero.
+- **No change to the model, blend, thresholds, stations, eligible markets or paper decision
+  logic** (`paper.py`, `evaluate.py`, `model.py`, `features.py`) during the period. Any such
+  change restarts the clock at zero. A change to the config hash always counts. Changes that
+  only add data collection, such as order books or trades, do not restart the clock.
 - **No live orders of any kind.**
 
 ## After the final look
@@ -52,7 +54,7 @@ The period only counts if all of these hold. Otherwise extend it.
 | Result | Next step |
 |---|---|
 | **Fail** | The blend's information does not hold up forward. Park the temperature model, or start a new hypothesis with a new frozen config and a fresh forward clock. |
-| **Pass, paper P&L 90% interval below or spanning 0** | The information is real but not tradable by taking the ask. Use the logged trade history (`market_trades`) to test resting limit orders. A new strategy needs its own frozen config and forward period. |
+| **Pass, paper P&L 90% interval below or spanning 0** | The information is real but not tradable by taking the ask. Study resting limit orders using the order books captured at each decision (`order_books`) plus the trade history (`market_trades`). Use a conservative queue model: the order joins the back of its price level and fills only after trades at that price exhaust the size ahead, with no credit for cancellations. Report optimistic and pessimistic fill bounds. A new strategy needs its own frozen config and forward period. |
 | **Pass, paper P&L 90% interval above 0, at least 300 trades** | Eligible for Phase 4: a tiny live test (1 contract per qualifying event). This also needs the execution and risk controls from the 2026-10-04 review: exposure limits, daily loss cap, stale-data rejection, order reconciliation and a kill switch. |
 
 ## Known limits

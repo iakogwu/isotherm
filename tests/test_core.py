@@ -339,3 +339,26 @@ def test_paper_report_applies_the_stopping_rule():
     text = paper.report(conn)
     assert "Per event" in text and "both" in text
     assert "Stopping rule: continue" in text
+
+
+def test_books_only_near_a_decision(monkeypatch):
+    import json
+    from datetime import datetime, timezone
+    from isotherm import kalshi
+    conn = _candle_db()   # KNYC markets A, B for 2026-09-01
+    conn.execute("UPDATE markets SET result=NULL")
+    eve = features.decision_time("America/New_York", date(2026, 9, 1), "eve")   # 05:00Z
+    assert kalshi._book_targets(conn, eve.replace(minute=7)) == ["A", "B"]
+    assert kalshi._book_targets(conn, eve.replace(hour=eve.hour + 3)) == []    # window over
+
+    class FakeNow(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return eve.replace(minute=7)
+
+    monkeypatch.setattr(kalshi, "datetime", FakeNow)
+    monkeypatch.setattr(kalshi, "get_json", lambda url, params=None, pause=None: {
+        "orderbook_fp": {"yes_dollars": [["0.4000", "12.00"]], "no_dollars": [["0.5500", "3.00"]]}})
+    assert kalshi.books(conn) == 2
+    yes, no = conn.execute("SELECT yes_levels, no_levels FROM order_books WHERE ticker='A'").fetchone()
+    assert json.loads(yes) == [["0.4000", "12.00"]] and json.loads(no) == [["0.5500", "3.00"]]

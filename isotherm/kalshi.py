@@ -1,11 +1,12 @@
 """Kalshi public market data: price snapshots and settlement results. Read-only, no key."""
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import config
+from . import config, features
 from .db import utcnow
 from .http import get_json
-from .timeutil import parse_event_date
+from .timeutil import climate_today, parse_event_date
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +100,47 @@ def backfill_outcomes(conn, days: int) -> int:
             _upsert_market(conn, m, t)
         conn.commit()
     return settle(conn)
+
+
+BOOK_WINDOW = timedelta(hours=2)   # hourly runs at :07 capture decision +7 min and +67 min
+
+
+def _book_targets(conn, now):
+    """Open markets whose station had a decision (features.decision_time) in the last BOOK_WINDOW."""
+    out = []
+    for st in conn.execute(
+            "SELECT * FROM stations WHERE station_id IN (SELECT station_id FROM series)").fetchall():
+        today = climate_today(st["tz"], now)
+        for d in (today, today + timedelta(days=1)):
+            if any(dec <= now < dec + BOOK_WINDOW
+                   for dec in (features.decision_time(st["tz"], d, hz) for hz in features.HORIZONS)):
+                out += [r[0] for r in conn.execute(
+                    """SELECT m.ticker FROM markets m JOIN series s USING(series_ticker)
+                       WHERE s.station_id=? AND m.target_date=? AND m.result IS NULL""",
+                    (st["station_id"], d.isoformat()))]
+    return out
+
+
+def books(conn) -> int:
+    """Snapshot the full order book of every market near a decision time."""
+    now = datetime.now(timezone.utc)
+    ts = utcnow()
+    n = 0
+    for ticker in _book_targets(conn, now):
+        try:
+            j = get_json(f"{config.KALSHI_API}/markets/{ticker}/orderbook", params={"depth": 0},
+                         pause=config.KALSHI_PAUSE)
+        except Exception as e:
+            log.warning("book %s failed: %s", ticker, e)
+            continue
+        ob = j.get("orderbook_fp") or j.get("orderbook") or {}
+        conn.execute("INSERT OR IGNORE INTO order_books(ticker, ts, yes_levels, no_levels) VALUES (?,?,?,?)",
+                     (ticker, ts, json.dumps(ob.get("yes_dollars", ob.get("yes")) or []),
+                      json.dumps(ob.get("no_dollars", ob.get("no")) or [])))
+        n += 1
+    conn.commit()
+    log.info("books: %d order books", n)
+    return n
 
 
 def fetch_trades(conn, ticker, historical: bool) -> int:
