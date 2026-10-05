@@ -5,7 +5,9 @@ from datetime import date, timedelta
 from .config import DB_PATH
 
 TABLES = ("stations", "series", "markets", "market_snapshots", "ensemble_forecasts",
-          "deterministic_forecasts", "mos_forecasts", "outcomes", "cli_reports")
+          "deterministic_forecasts", "mos_forecasts", "outcomes", "cli_reports", "hist_forecasts",
+          "market_candles", "candles_done", "market_trades", "trades_done", "paper_predictions",
+          "paper_decisions")
 
 
 def status(conn):

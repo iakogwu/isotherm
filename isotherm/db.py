@@ -191,6 +191,25 @@ CREATE TABLE IF NOT EXISTS paper_decisions (
     PRIMARY KEY (station_id, target_date, horizon, kind)
 );
 
+-- Every executed trade (time and sales), fetched once per market after it settles. Lets us
+-- test resting limit orders later: hourly quotes can't say whether a bid would have filled.
+CREATE TABLE IF NOT EXISTS market_trades (
+    trade_id        TEXT PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    created_time    TEXT NOT NULL,
+    yes_price       REAL,
+    count           REAL,
+    taker_side      TEXT,                  -- yes | no: which side crossed the spread
+    is_block        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_market_trades_ticker_time ON market_trades(ticker, created_time);
+
+CREATE TABLE IF NOT EXISTS trades_done (
+    ticker          TEXT PRIMARY KEY,
+    n               INTEGER,
+    fetched_at      TEXT
+);
+
 CREATE TABLE IF NOT EXISTS job_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     job             TEXT NOT NULL,

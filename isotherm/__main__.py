@@ -27,6 +27,7 @@ JOBS = {
     "settle": kalshi.settle,
     "cli": climate.run,
     "paper": paper.run,
+    "trades": kalshi.trades,
 }
 LOCK = config.DATA_DIR / "run.lock"
 
@@ -96,7 +97,7 @@ def cmd_run(conn, force: bool) -> int:
     try:
         ok = True
         # discover first so a fresh install has series/stations to work with
-        for job in ("discover", "markets", "forecasts", "mos", "settle", "cli", "paper"):
+        for job in ("discover", "markets", "forecasts", "mos", "settle", "cli", "paper", "trades"):
             if force or _due(conn, job):
                 ok &= run_job(conn, job)
         return 0 if ok else 1
@@ -119,7 +120,8 @@ def main(argv=None) -> int:
     b.add_argument("end_year", type=int)
     h = sub.add_parser("backfill-history", help="Phase 2/3 history (resumable; slow)")
     h.add_argument("--since", default="2024-02-01")
-    h.add_argument("--step", choices=("all", "markets", "forecasts", "nbs", "candles"), default="all")
+    h.add_argument("--step", choices=("all", "markets", "forecasts", "nbs", "candles", "trades"),
+                   default="all")
     h.add_argument("--retry-empty", action="store_true",
                    help="candles: re-fetch markets whose earlier fetch returned no candles")
     o = sub.add_parser("backfill-outcomes", help="load recently settled Kalshi results")
@@ -149,6 +151,8 @@ def main(argv=None) -> int:
                 "candles": history.backfill_candles}[args.step]
         if args.step == "candles":
             history.backfill_candles(conn, since, retry_empty=args.retry_empty)
+        elif args.step == "trades":   # not part of "all": optional, slow
+            kalshi.trades(conn, since=since.isoformat())
         else:
             step(conn, since)
         return 0

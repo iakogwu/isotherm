@@ -51,6 +51,7 @@ INTERVALS_MIN = {
     "settle": 170,
     "cli": 12 * 60,
     "paper": 50,
+    "trades": 6 * 60,
 }
 
 # Polite pacing between HTTP calls (seconds).

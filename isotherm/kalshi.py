@@ -101,6 +101,57 @@ def backfill_outcomes(conn, days: int) -> int:
     return settle(conn)
 
 
+def fetch_trades(conn, ticker, historical: bool) -> int:
+    """Store every trade for one market (all pages) and mark it done, in one transaction."""
+    path = "/historical/trades" if historical else "/markets/trades"
+    n, cursor = 0, None
+    while True:
+        p = {"ticker": ticker, "limit": 1000}
+        if cursor:
+            p["cursor"] = cursor
+        j = get_json(f"{config.KALSHI_API}{path}", params=p, pause=config.KALSHI_PAUSE)
+        for t in j.get("trades", []):
+            conn.execute(
+                """INSERT OR IGNORE INTO market_trades(trade_id, ticker, created_time, yes_price,
+                       count, taker_side, is_block) VALUES (?,?,?,?,?,?,?)""",
+                (t["trade_id"], t["ticker"], t["created_time"],
+                 _f(t.get("yes_price_dollars", t.get("yes_price"))),
+                 _f(t.get("count_fp", t.get("count"))), t.get("taker_side"),
+                 int(bool(t.get("is_block_trade")))))
+            n += 1
+        cursor = j.get("cursor")
+        if not cursor:
+            break
+    conn.execute("INSERT OR REPLACE INTO trades_done(ticker, n, fetched_at) VALUES (?,?,?)",
+                 (ticker, n, utcnow()))
+    return n
+
+
+def trades(conn, days: int = 14, since: str | None = None) -> int:
+    """Fetch trade history for settled markets not yet fetched: the last `days` days by default,
+    or everything from `since` (a backfill). Resumable: each market commits on its own."""
+    cutoff = get_json(f"{config.KALSHI_API}/historical/cutoff").get("market_settled_ts")
+    start = since or (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """SELECT ticker, close_time FROM markets
+           WHERE result IS NOT NULL AND target_date >= ?
+             AND ticker NOT IN (SELECT ticker FROM trades_done)
+           ORDER BY target_date DESC""", (start,)).fetchall()
+    n = 0
+    for i, r in enumerate(rows):
+        historical = bool(cutoff and r["close_time"] and r["close_time"] < cutoff)
+        try:
+            n += fetch_trades(conn, r["ticker"], historical)
+            conn.commit()
+        except Exception as e:   # not marked done, so it is retried next run
+            conn.rollback()
+            log.warning("trades %s failed: %s", r["ticker"], e)
+        if since and (i + 1) % 500 == 0:
+            log.info("trades: %d/%d markets", i + 1, len(rows))
+    log.info("trades: %d trades across %d markets", n, len(rows))
+    return n
+
+
 def settle(conn) -> int:
     """Fill in results for events whose climate day is over."""
     today = datetime.now(timezone.utc).date().isoformat()

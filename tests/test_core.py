@@ -286,3 +286,35 @@ def test_traded_crps_matches_numeric_integral(monkeypatch):
     assert math.isclose(float(model.crps_traded(mu, sigma, y)), numeric, rel_tol=1e-6)
     # the 80% interval used for coverage is the traded distribution's, not a Gaussian's
     assert math.isclose(student_t.cdf(model.central_z(0.8) / model.SIGMA_SCALE, v), 0.9, rel_tol=1e-9)
+
+
+def test_trades_pages_through_and_retries_failures(monkeypatch):
+    from isotherm import kalshi
+    conn = _candle_db()   # settled markets A, B for 2026-09-01
+    conn.execute("UPDATE markets SET close_time='2026-09-02T04:00:00Z'")
+    conn.execute("UPDATE markets SET close_time='2026-07-01T04:00:00Z' WHERE ticker='B'")
+    paths, fail = [], {"B"}
+
+    def fake_get_json(url, params=None, pause=None):
+        if url.endswith("/historical/cutoff"):
+            return {"market_settled_ts": "2026-08-05T00:00:00Z"}
+        paths.append((url.split("/trade-api/v2")[1], params["ticker"], params.get("cursor")))
+        if params["ticker"] in fail:
+            raise ConnectionError("down")
+        page = params.get("cursor") or "p1"
+        trade = {"trade_id": f"{params['ticker']}-{page}", "ticker": params["ticker"],
+                 "created_time": "2026-09-01T12:00:00Z", "yes_price_dollars": "0.4200",
+                 "count_fp": "5.00", "taker_side": "yes", "is_block_trade": False}
+        return {"trades": [trade], "cursor": "p2" if page == "p1" else ""}
+
+    monkeypatch.setattr(kalshi, "get_json", fake_get_json)
+    assert kalshi.trades(conn, since="2026-01-01") == 2           # A: two pages; B failed
+    assert ("/markets/trades", "A", "p2") in paths
+    assert ("/historical/trades", "B", None) in paths              # closed before the cutoff
+    assert [r[0] for r in conn.execute("SELECT ticker FROM trades_done")] == ["A"]
+    row = conn.execute("SELECT yes_price, count, taker_side FROM market_trades LIMIT 1").fetchone()
+    assert tuple(row) == (0.42, 5.0, "yes")
+
+    fail.clear(); paths.clear()
+    assert kalshi.trades(conn, since="2026-01-01") == 2           # only B is fetched again
+    assert {p[1] for p in paths} == {"B"}
