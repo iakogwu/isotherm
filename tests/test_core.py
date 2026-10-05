@@ -320,27 +320,6 @@ def test_trades_pages_through_and_retries_failures(monkeypatch):
     assert {p[1] for p in paths} == {"B"}
 
 
-def test_paper_report_applies_the_stopping_rule():
-    from isotherm import paper
-    con = _synthetic_contracts()
-    con = con[con["target_date"].between("2026-04-01", "2026-05-20")]   # 50 dates: interim zone
-    conn = _candle_db()
-    conn.execute("DELETE FROM markets")
-    for r in con.itertuples():
-        conn.execute("""INSERT INTO markets(ticker, event_ticker, series_ticker, target_date, result)
-                        VALUES (?,?,'KXHIGHNY',?,?)""", (r.ticker, r.event_ticker, r.target_date,
-                                                         "yes" if r.y else "no"))
-        mid = (r.yes_bid + r.yes_ask) / 2
-        conn.execute("""INSERT INTO paper_predictions(ticker, horizon, event_ticker, decision_ts,
-                            model_version, p_model, yes_bid, yes_ask, action, created_at, p_trade)
-                        VALUES (?,?,?,?,'test',?,?,?,'none','now',?)""",
-                     (r.ticker, r.horizon, r.event_ticker, r.target_date, r.p_model, r.yes_bid,
-                      r.yes_ask, (mid + r.p_model) / 2))   # averaging two noisy views beats either
-    text = paper.report(conn)
-    assert "Per event" in text and "both" in text
-    assert "Stopping rule: continue" in text
-
-
 def test_books_only_near_a_decision(monkeypatch):
     import json
     from datetime import datetime, timezone
@@ -362,3 +341,76 @@ def test_books_only_near_a_decision(monkeypatch):
     assert kalshi.books(conn) == 2
     yes, no = conn.execute("SELECT yes_levels, no_levels FROM order_books WHERE ticker='A'").fetchone()
     assert json.loads(yes) == [["0.4000", "12.00"]] and json.loads(no) == [["0.5500", "3.00"]]
+
+
+def _forward_db(monkeypatch, start, n_dates, skip_decisions=0, sharp=False):
+    """Forward paper data for n_dates from `start`; the first `skip_decisions` dates have no
+    recorded decision (the PC was off) though markets still settle."""
+    import pandas as pd
+    from isotherm import paper
+    monkeypatch.setattr(paper, "FORWARD_START", start)
+    monkeypatch.setattr(paper, "_load_blend", lambda: ({"config_hash": "test"}, "ok"))
+    con = _synthetic_contracts()
+    dates = sorted(d for d in con["target_date"].unique() if d >= start)[:n_dates]
+    con = con[con["target_date"].isin(dates)]
+    conn = _candle_db()
+    conn.execute("DELETE FROM markets")
+    for r in con.itertuples():
+        conn.execute("""INSERT INTO markets(ticker, event_ticker, series_ticker, target_date, result)
+                        VALUES (?,?,'KXHIGHNY',?,?)""", (r.ticker, r.event_ticker, r.target_date,
+                                                         "yes" if r.y else "no"))
+        mid = (r.yes_bid + r.yes_ask) / 2
+        conn.execute("""INSERT INTO paper_predictions(ticker, horizon, event_ticker, decision_ts,
+                            model_version, p_model, yes_bid, yes_ask, action, created_at, p_trade)
+                        VALUES (?,?,?,?,'test',?,?,?,'none','now',?)""",
+                     (r.ticker, r.horizon, r.event_ticker, r.target_date, r.p_model, r.yes_bid,
+                      r.yes_ask, 0.4 * mid + 0.6 * r.y if sharp else (mid + r.p_model) / 2))
+    for d in dates[skip_decisions:]:
+        for hz in ("open", "eve"):
+            conn.execute("""INSERT INTO paper_decisions(station_id, target_date, horizon, kind,
+                                decision_ts, status, created_at) VALUES ('KNYC',?,?,'high',?,'recorded','now')""",
+                         (d, hz, d))
+    conn.commit()
+    return conn, dates
+
+
+def test_forward_look_is_recorded_once_at_a_point_fixed_by_the_data(monkeypatch):
+    import sqlite3
+    import pytest
+    from isotherm import paper
+    conn, dates = _forward_db(monkeypatch, "2025-06-01", 60)
+    assert paper.report(conn).startswith("No forward look recorded")    # hidden before the look
+    assert paper.check_looks(conn) == 1
+    look = conn.execute("SELECT * FROM forward_looks").fetchone()
+    assert look["look"] == "interim" and look["through_date"] == dates[44]   # the 45th date
+    assert look["verdict"].startswith("CONTINUE") and look["estimate"] < 0
+    first = tuple(look)
+    conn.execute("UPDATE paper_predictions SET p_trade = 0.5")           # later data can't change it
+    assert paper.check_looks(conn) == 0
+    assert tuple(conn.execute("SELECT * FROM forward_looks").fetchone()) == first
+    with pytest.raises(sqlite3.DatabaseError):
+        conn.execute("UPDATE forward_looks SET verdict='PASS'")
+    with pytest.raises(sqlite3.DatabaseError):
+        conn.execute("DELETE FROM forward_looks")
+    text = paper.report(conn)
+    assert "INTERIM look through" in text and "FINAL" not in text
+
+
+def test_final_look_needs_its_own_point_and_records_pass(monkeypatch):
+    from isotherm import paper
+    conn, dates = _forward_db(monkeypatch, "2025-06-01", 100, sharp=True)   # a clearly better blend
+    assert paper.check_looks(conn) == 2
+    got = dict(conn.execute("SELECT look, through_date FROM forward_looks").fetchall())
+    assert got == {"interim": dates[44], "final": dates[89]}
+    assert conn.execute("SELECT verdict FROM forward_looks WHERE look='final'").fetchone()[0].startswith("PASS")
+
+
+def test_completeness_gates_the_look_and_is_anchored_at_the_start(monkeypatch):
+    from isotherm import paper
+    # the PC was off for the first 10 days: no decision rows at all for them
+    conn, dates = _forward_db(monkeypatch, "2025-06-01", 60, skip_decisions=10)
+    share, expected = paper.completeness(conn, dates[44])
+    assert expected == 45 * 2 and abs(share - 35 / 45) < 1e-9          # counted from the start
+    assert paper.check_looks(conn) == 0                                # 78% < 90%: no look yet
+    status = paper.status(conn)
+    assert "Settled forward dates: 60" in status and "logscore" not in status

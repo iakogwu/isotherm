@@ -185,11 +185,106 @@ def run(conn) -> int:
     return n
 
 
-# Forward-test stopping rule, written down before any forward result existed:
-# docs/forward-test-plan.md. Change it only by writing a new plan and restarting the clock.
+# Forward-test stopping rule, registered before any forward result existed:
+# docs/forward-test-plan.md. Each look is computed once, at a point fixed by the data, stored in
+# forward_looks and never recomputed. Between looks only collection health is shown.
+FORWARD_START = "2026-10-05"
 INTERIM_DATES = 45   # futility look only: stop if the blend isn't ahead of the market
 FINAL_DATES = 90     # the one success look
-MIN_COMPLETE = 0.90  # share of due decisions actually recorded for the period to count
+MIN_COMPLETE = 0.90  # share of expected decisions actually recorded, counted from FORWARD_START
+
+
+def _settled(conn) -> pd.DataFrame:
+    s = pd.read_sql_query(
+        """SELECT p.*, m.result, m.target_date FROM paper_predictions p JOIN markets m USING(ticker)
+           WHERE m.result IN ('yes', 'no') AND m.target_date >= ?""", conn, params=(FORWARD_START,))
+    s["y"] = (s["result"] == "yes").astype(int)
+    return s
+
+
+def completeness(conn, through: str) -> tuple:
+    """(recorded share, expected count) of decisions for target dates FORWARD_START..through.
+    Expected = every series x horizon x day, so a PC that was off (no row at all) counts as missed."""
+    n_series = conn.execute("SELECT COUNT(*) FROM series").fetchone()[0]
+    days = (pd.Timestamp(through) - pd.Timestamp(FORWARD_START)).days + 1
+    expected = max(days, 0) * n_series * len(features.HORIZONS)
+    recorded = conn.execute(
+        """SELECT COUNT(*) FROM paper_decisions WHERE status='recorded'
+           AND target_date BETWEEN ? AND ?""", (FORWARD_START, through)).fetchone()[0]
+    return (recorded / expected if expected else 0.0), expected
+
+
+def _look_point(conn, s: pd.DataFrame, need: int, after: str | None):
+    """The first settled date at which `need` settled dates exist and completeness through it is
+    at least MIN_COMPLETE. Fixed by the data, not by when this runs."""
+    dates = sorted(s["target_date"].unique())
+    for i, d in enumerate(dates):
+        if i + 1 >= need and (after is None or d > after) and completeness(conn, d)[0] >= MIN_COMPLETE:
+            return d
+    return None
+
+
+def _evaluate_look(conn, s: pd.DataFrame, through: str) -> dict:
+    s = s[s["target_date"] <= through]
+    ev = _forward_events(s)
+    if ev.empty:
+        return {"estimate": None, "ci_lo": None, "ci_hi": None, "table": "(no fully quoted events)"}
+    ev["part"] = "forward"
+    tab = evaluate._event_table(pd.concat([ev, ev.assign(horizon="both")]), "part")
+    d = tab[tab["horizon"] == "both"].iloc[0]
+    text = evaluate._fmt(tab)
+    t = s[s["action"].isin(["buy_yes", "buy_no"])].copy()
+    if not t.empty:
+        yes = t["action"] == "buy_yes"
+        t["won"] = np.where(yes, t["y"] == 1, t["y"] == 0).astype(int)
+        t["pnl"] = t["won"] - t["price"] - t["fee"]
+        lo, hi = evaluate._boot_ci(t)
+        text += (f"\nPaper trades: {len(t)} on {t['target_date'].nunique()} dates, expected edge "
+                 f"{t['exp_edge'].mean():+.3f}/contract, realized {t['pnl'].mean():+.3f}/contract, "
+                 f"90% CI [{lo:+.3f}, {hi:+.3f}] (dates resampled)")
+    return {"estimate": float(d["blend_minus_market"]), "ci_lo": float(d["ci90_lo"]),
+            "ci_hi": float(d["ci90_hi"]), "table": text}
+
+
+def check_looks(conn) -> int:
+    """Record the interim and final looks once each, when their registered conditions are met.
+    Runs inside the hourly job; never replaces a recorded look."""
+    done = {r[0]: r[1] for r in conn.execute("SELECT look, verdict FROM forward_looks")}
+    s = _settled(conn)
+    if s.empty:
+        return 0
+    n = 0
+    for look, need in (("interim", INTERIM_DATES), ("final", FINAL_DATES)):
+        if look in done:
+            continue
+        if look == "final" and ("interim" not in done or done["interim"].startswith("STOP")):
+            break
+        after = (conn.execute("SELECT through_date FROM forward_looks WHERE look='interim'").fetchone()
+                 or [None])[0] if look == "final" else None
+        through = _look_point(conn, s, need, after)
+        if through is None:
+            break
+        r = _evaluate_look(conn, s, through)
+        est, hi = r["estimate"], r["ci_hi"]
+        if look == "interim":
+            verdict = ("STOP (futility): blend not ahead of the market" if est is None or est >= 0
+                       else "CONTINUE: blend ahead at the interim look")
+        else:
+            verdict = ("PASS: blend beats the market (90% CI below zero)" if hi is not None and hi < 0
+                       else "FAIL: no clear improvement over the market")
+        share, expected = completeness(conn, through)
+        conn.execute(
+            """INSERT INTO forward_looks(look, through_date, settled_dates, completeness, expected,
+                   estimate, ci_lo, ci_hi, verdict, detail, blend_hash, recorded_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (look, through, int(s.loc[s["target_date"] <= through, "target_date"].nunique()),
+             share, expected, est, r["ci_lo"], hi, verdict, r["table"],
+             (_load_blend()[0] or {}).get("config_hash"), utcnow()))
+        conn.commit()
+        log.info("forward look %s recorded through %s: %s", look, through, verdict)
+        done[look] = verdict
+        n += 1
+    return n
 
 
 def _forward_events(s: pd.DataFrame) -> pd.DataFrame:
@@ -199,58 +294,38 @@ def _forward_events(s: pd.DataFrame) -> pd.DataFrame:
     return evaluate.event_scores(c, ["p_mkt", "p_model", "p_blend"])
 
 
-def report(conn) -> str:
-    df = pd.read_sql_query(
-        """SELECT p.*, m.result, m.target_date FROM paper_predictions p JOIN markets m USING(ticker)""", conn)
-    dec = pd.read_sql_query("SELECT status, COUNT(*) n FROM paper_decisions GROUP BY status", conn)
-    lines = ["Decisions: " + (", ".join(f"{r.status}={r.n}" for r in dec.itertuples()) or "none yet")]
-    if not dec.empty:
-        # against every decision that should exist: a PC that was off leaves no row at all
-        first, last = conn.execute("SELECT MIN(target_date), MAX(target_date) FROM paper_decisions").fetchone()
-        n_series = conn.execute("SELECT COUNT(*) FROM series").fetchone()[0]
-        expected = ((pd.Timestamp(last) - pd.Timestamp(first)).days + 1) * n_series * len(features.HORIZONS)
-        complete = dec.loc[dec["status"] == "recorded", "n"].sum() / expected
-        lines.append(f"Recorded {complete:.1%} of {expected} expected decisions {first} to {last} "
-                     f"(rule needs >= {MIN_COMPLETE:.0%})")
-    if df.empty:
-        return "\n".join(lines + ["No paper predictions yet. They start at the next decision time "
-                                   "after the hourly job runs."])
-    s = df[df["result"].isin(["yes", "no"])].copy()
-    lines += [f"Paper predictions: {len(df)} contracts recorded, {len(s)} settled.", ""]
-    if s.empty:
-        return "\n".join(lines)
-    s["y"] = (s["result"] == "yes").astype(int)
-
-    ev = _forward_events(s)
-    if not ev.empty:
-        ev["part"] = "forward"
-        both = ev.assign(horizon="both")
-        tab = evaluate._event_table(pd.concat([ev, both]), "part")
-        dates = ev["target_date"].nunique()
-        lines += ["Per event (all brackets quoted), blend vs market; CI resamples whole dates:",
-                  evaluate._fmt(tab), ""]
-        d = tab[tab["horizon"] == "both"].iloc[0]
-        if dates < INTERIM_DATES:
-            verdict = f"collecting: {dates}/{INTERIM_DATES} settled dates until the futility look"
-        elif dates < FINAL_DATES:
-            verdict = ("STOP (futility): the blend is not ahead of the market"
-                       if d["blend_minus_market"] >= 0 else
-                       f"continue: blend ahead at the interim look; {dates}/{FINAL_DATES} dates")
-        else:
-            verdict = ("PASS: blend beats the market (90% CI below zero)" if d["ci90_hi"] < 0
-                       else "FAIL: no clear improvement over the market at the final look")
-        lines += [f"Stopping rule: {verdict}", ""]
-
-    t = s[s["action"].isin(["buy_yes", "buy_no"])].copy()
-    if not t.empty:
-        yes = t["action"] == "buy_yes"
-        t["won"] = np.where(yes, t["y"] == 1, t["y"] == 0).astype(int)
-        t["pnl"] = t["won"] - t["price"] - t["fee"]
-        lo, hi = evaluate._boot_ci(t)
-        lines += [f"Paper trades settled: {len(t)} on {t['target_date'].nunique()} dates  "
-                  f"win rate {t['won'].mean():.1%}  avg price {t['price'].mean():.2f}",
-                  f"Expected edge {t['exp_edge'].mean():+.3f}/contract  realized {t['pnl'].mean():+.3f}/contract  "
-                  f"90% CI [{lo:+.3f}, {hi:+.3f}] (dates resampled)  total ${t['pnl'].sum():+.2f} per 1-contract stake"]
-        for hz, g in t.groupby("horizon"):
-            lines.append(f"  {hz:<5} trades={len(g)}  realized {g['pnl'].mean():+.3f}/contract")
+def status(conn) -> str:
+    """Collection health only. No performance numbers, so routine checks can't peek."""
+    dec = dict(conn.execute(
+        "SELECT status, COUNT(*) FROM paper_decisions WHERE target_date >= ? GROUP BY status",
+        (FORWARD_START,)).fetchall())
+    s = _settled(conn)
+    dates = s["target_date"].nunique()
+    yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    lines = [f"Forward test from {FORWARD_START}. Decisions: "
+             + (", ".join(f"{k}={v}" for k, v in sorted(dec.items())) or "none yet")]
+    if yesterday >= FORWARD_START:
+        share, expected = completeness(conn, yesterday)
+        lines.append(f"Recorded {share:.1%} of {expected} expected decisions through {yesterday} "
+                     f"(looks need >= {MIN_COMPLETE:.0%})")
+    lines.append(f"Settled forward dates: {dates}  (interim look at {INTERIM_DATES}, final at {FINAL_DATES})")
+    looks = conn.execute("SELECT look, through_date FROM forward_looks ORDER BY recorded_at").fetchall()
+    lines.append("Looks recorded: " + (", ".join(f"{a} through {b}" for a, b in looks) or "none")
+                 + ". Results: python -m isotherm paper-report")
     return "\n".join(lines)
+
+
+def report(conn) -> str:
+    """The recorded looks, exactly as stored. Nothing is computed here."""
+    rows = conn.execute("SELECT * FROM forward_looks ORDER BY recorded_at").fetchall()
+    if not rows:
+        return ("No forward look recorded yet. Results stay hidden until the registered looks "
+                f"({INTERIM_DATES} and {FINAL_DATES} settled dates, >= {MIN_COMPLETE:.0%} recorded); "
+                "see `paper-status` for collection health.")
+    out = []
+    for r in rows:
+        out += [f"== {r['look'].upper()} look through {r['through_date']} (recorded {r['recorded_at']}, "
+                f"blend {r['blend_hash']})",
+                f"Settled dates {r['settled_dates']}, completeness {r['completeness']:.1%} of {r['expected']}",
+                r["detail"], f"Verdict: {r['verdict']}", ""]
+    return "\n".join(out)

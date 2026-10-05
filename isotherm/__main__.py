@@ -29,6 +29,7 @@ JOBS = {
     "paper": paper.run,
     "trades": kalshi.trades,
     "books": kalshi.books,
+    "looks": paper.check_looks,
 }
 LOCK = config.DATA_DIR / "run.lock"
 
@@ -99,7 +100,7 @@ def cmd_run(conn, force: bool) -> int:
         ok = True
         # discover first so a fresh install has series/stations to work with
         for job in ("discover", "markets", "books", "forecasts", "mos", "settle", "cli", "paper",
-                    "trades"):
+                    "trades", "looks"):
             if force or _due(conn, job):
                 ok &= run_job(conn, job)
         return 0 if ok else 1
@@ -130,7 +131,8 @@ def main(argv=None) -> int:
     o.add_argument("--days", type=int, default=30)
     ev = sub.add_parser("evaluate", help="Phase 2 skill + Phase 3 backtest report")
     ev.add_argument("--reuse", action="store_true", help="reuse the latest saved predictions (fast)")
-    sub.add_parser("paper-report", help="score forward paper trades")
+    sub.add_parser("paper-report", help="the recorded forward-test looks (hidden until registered)")
+    sub.add_parser("paper-status", help="forward-test collection health (no performance numbers)")
     sub.add_parser("status", help="collection health summary")
     p = sub.add_parser("peek", help="sanity-check one event (raw, uncalibrated)")
     p.add_argument("event_ticker")
@@ -160,6 +162,9 @@ def main(argv=None) -> int:
         return 0
     if args.cmd == "paper-report":
         print(paper.report(conn))
+        return 0
+    if args.cmd == "paper-status":
+        print(paper.status(conn))
         return 0
     if args.cmd == "evaluate":
         from . import evaluate

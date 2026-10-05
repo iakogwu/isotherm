@@ -221,6 +221,26 @@ CREATE TABLE IF NOT EXISTS trades_done (
     fetched_at      TEXT
 );
 
+-- The registered forward-test looks (docs/forward-test-plan.md). Written once each, never updated.
+CREATE TABLE IF NOT EXISTS forward_looks (
+    look            TEXT PRIMARY KEY,      -- interim | final
+    through_date    TEXT NOT NULL,
+    settled_dates   INTEGER,
+    completeness    REAL,
+    expected        INTEGER,
+    estimate        REAL,                  -- per-event log score, blend minus market
+    ci_lo           REAL,
+    ci_hi           REAL,
+    verdict         TEXT NOT NULL,
+    detail          TEXT,
+    blend_hash      TEXT,
+    recorded_at     TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS forward_looks_no_update BEFORE UPDATE ON forward_looks
+BEGIN SELECT RAISE(ABORT, 'forward looks are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS forward_looks_no_delete BEFORE DELETE ON forward_looks
+BEGIN SELECT RAISE(ABORT, 'forward looks are immutable'); END;
+
 CREATE TABLE IF NOT EXISTS job_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     job             TEXT NOT NULL,

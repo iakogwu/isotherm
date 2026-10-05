@@ -7,7 +7,7 @@ from .config import DB_PATH
 TABLES = ("stations", "series", "markets", "market_snapshots", "ensemble_forecasts",
           "deterministic_forecasts", "mos_forecasts", "outcomes", "cli_reports", "hist_forecasts",
           "market_candles", "candles_done", "market_trades", "trades_done", "order_books", "paper_predictions",
-          "paper_decisions")
+          "paper_decisions", "forward_looks")
 
 
 def status(conn):
