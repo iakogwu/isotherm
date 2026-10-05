@@ -318,3 +318,24 @@ def test_trades_pages_through_and_retries_failures(monkeypatch):
     fail.clear(); paths.clear()
     assert kalshi.trades(conn, since="2026-01-01") == 2           # only B is fetched again
     assert {p[1] for p in paths} == {"B"}
+
+
+def test_paper_report_applies_the_stopping_rule():
+    from isotherm import paper
+    con = _synthetic_contracts()
+    con = con[con["target_date"].between("2026-04-01", "2026-05-20")]   # 50 dates: interim zone
+    conn = _candle_db()
+    conn.execute("DELETE FROM markets")
+    for r in con.itertuples():
+        conn.execute("""INSERT INTO markets(ticker, event_ticker, series_ticker, target_date, result)
+                        VALUES (?,?,'KXHIGHNY',?,?)""", (r.ticker, r.event_ticker, r.target_date,
+                                                         "yes" if r.y else "no"))
+        mid = (r.yes_bid + r.yes_ask) / 2
+        conn.execute("""INSERT INTO paper_predictions(ticker, horizon, event_ticker, decision_ts,
+                            model_version, p_model, yes_bid, yes_ask, action, created_at, p_trade)
+                        VALUES (?,?,?,?,'test',?,?,?,'none','now',?)""",
+                     (r.ticker, r.horizon, r.event_ticker, r.target_date, r.p_model, r.yes_bid,
+                      r.yes_ask, (mid + r.p_model) / 2))   # averaging two noisy views beats either
+    text = paper.report(conn)
+    assert "Per event" in text and "both" in text
+    assert "Stopping rule: continue" in text

@@ -185,40 +185,72 @@ def run(conn) -> int:
     return n
 
 
+# Forward-test stopping rule, written down before any forward result existed:
+# docs/forward-test-plan.md. Change it only by writing a new plan and restarting the clock.
+INTERIM_DATES = 45   # futility look only: stop if the blend isn't ahead of the market
+FINAL_DATES = 90     # the one success look
+MIN_COMPLETE = 0.90  # share of due decisions actually recorded for the period to count
+
+
+def _forward_events(s: pd.DataFrame) -> pd.DataFrame:
+    """Per-event scores for settled forward predictions, as in evaluate.event_scores."""
+    c = s.assign(p_mkt=(s["yes_bid"] + s["yes_ask"]) / 2, p_blend=s["p_trade"],
+                 split="forward", dev_part=None)
+    return evaluate.event_scores(c, ["p_mkt", "p_model", "p_blend"])
+
+
 def report(conn) -> str:
     df = pd.read_sql_query(
         """SELECT p.*, m.result, m.target_date FROM paper_predictions p JOIN markets m USING(ticker)""", conn)
+    dec = pd.read_sql_query("SELECT status, COUNT(*) n FROM paper_decisions GROUP BY status", conn)
+    lines = ["Decisions: " + (", ".join(f"{r.status}={r.n}" for r in dec.itertuples()) or "none yet")]
+    if not dec.empty:
+        # against every decision that should exist: a PC that was off leaves no row at all
+        first, last = conn.execute("SELECT MIN(target_date), MAX(target_date) FROM paper_decisions").fetchone()
+        n_series = conn.execute("SELECT COUNT(*) FROM series").fetchone()[0]
+        expected = ((pd.Timestamp(last) - pd.Timestamp(first)).days + 1) * n_series * len(features.HORIZONS)
+        complete = dec.loc[dec["status"] == "recorded", "n"].sum() / expected
+        lines.append(f"Recorded {complete:.1%} of {expected} expected decisions {first} to {last} "
+                     f"(rule needs >= {MIN_COMPLETE:.0%})")
     if df.empty:
-        return "No paper predictions yet. They start at the next decision time after the hourly job runs."
+        return "\n".join(lines + ["No paper predictions yet. They start at the next decision time "
+                                   "after the hourly job runs."])
     s = df[df["result"].isin(["yes", "no"])].copy()
-    lines = [f"Paper predictions: {len(df)} contracts recorded, {len(s)} settled.",
-             "Decisions: " + ", ".join(f"{st}={c}" for st, c in conn.execute(
-                 "SELECT status, COUNT(*) FROM paper_decisions GROUP BY status ORDER BY status")), ""]
+    lines += [f"Paper predictions: {len(df)} contracts recorded, {len(s)} settled.", ""]
     if s.empty:
         return "\n".join(lines)
     s["y"] = (s["result"] == "yes").astype(int)
-    q = s.dropna(subset=["yes_bid", "yes_ask"])
-    q = q[(q["yes_ask"] > q["yes_bid"]) & (q["yes_bid"] > 0) & (q["yes_ask"] < 1)]
-    if not q.empty:
-        pm = (q["yes_bid"] + q["yes_ask"]) / 2
-        bl = q["p_trade"].notna()
-        lines.append(f"Brier  model={np.mean((q['p_model'] - q['y']) ** 2):.4f}  "
-                     f"market={np.mean((pm - q['y']) ** 2):.4f}  (n={len(q)})")
-        if bl.any():
-            lines.append(f"Brier  blend={np.mean((q.loc[bl, 'p_trade'] - q.loc[bl, 'y']) ** 2):.4f}  "
-                         f"market={np.mean((pm[bl] - q.loc[bl, 'y']) ** 2):.4f}  (n={int(bl.sum())})  "
-                         "<- blend must beat market here")
+
+    ev = _forward_events(s)
+    if not ev.empty:
+        ev["part"] = "forward"
+        both = ev.assign(horizon="both")
+        tab = evaluate._event_table(pd.concat([ev, both]), "part")
+        dates = ev["target_date"].nunique()
+        lines += ["Per event (all brackets quoted), blend vs market; CI resamples whole dates:",
+                  evaluate._fmt(tab), ""]
+        d = tab[tab["horizon"] == "both"].iloc[0]
+        if dates < INTERIM_DATES:
+            verdict = f"collecting: {dates}/{INTERIM_DATES} settled dates until the futility look"
+        elif dates < FINAL_DATES:
+            verdict = ("STOP (futility): the blend is not ahead of the market"
+                       if d["blend_minus_market"] >= 0 else
+                       f"continue: blend ahead at the interim look; {dates}/{FINAL_DATES} dates")
+        else:
+            verdict = ("PASS: blend beats the market (90% CI below zero)" if d["ci90_hi"] < 0
+                       else "FAIL: no clear improvement over the market at the final look")
+        lines += [f"Stopping rule: {verdict}", ""]
+
     t = s[s["action"].isin(["buy_yes", "buy_no"])].copy()
     if not t.empty:
         yes = t["action"] == "buy_yes"
         t["won"] = np.where(yes, t["y"] == 1, t["y"] == 0).astype(int)
         t["pnl"] = t["won"] - t["price"] - t["fee"]
-        t["station_id"] = t["event_ticker"]
         lo, hi = evaluate._boot_ci(t)
-        lines += [f"Paper trades settled: {len(t)}  win rate {t['won'].mean():.1%}  "
-                  f"avg price {t['price'].mean():.2f}",
+        lines += [f"Paper trades settled: {len(t)} on {t['target_date'].nunique()} dates  "
+                  f"win rate {t['won'].mean():.1%}  avg price {t['price'].mean():.2f}",
                   f"Expected edge {t['exp_edge'].mean():+.3f}/contract  realized {t['pnl'].mean():+.3f}/contract  "
-                  f"90% CI [{lo:+.3f}, {hi:+.3f}]  total ${t['pnl'].sum():+.2f} per 1-contract stake"]
+                  f"90% CI [{lo:+.3f}, {hi:+.3f}] (dates resampled)  total ${t['pnl'].sum():+.2f} per 1-contract stake"]
         for hz, g in t.groupby("horizon"):
             lines.append(f"  {hz:<5} trades={len(g)}  realized {g['pnl'].mean():+.3f}/contract")
     return "\n".join(lines)
