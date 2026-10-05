@@ -1,8 +1,9 @@
 # Isotherm
 
-Research platform for Kalshi daily temperature markets. **Phase 1: read-only data logger.**
+Research platform for Kalshi daily temperature markets: a read-only logger, a calibrated
+temperature model, an evaluation against the NWS forecast and the market, and forward paper trading.
 
-No API keys, no account, no orders. It only records:
+No API keys, no account, no orders. The logger records:
 
 | What | Source | Why |
 |---|---|---|
@@ -16,7 +17,7 @@ No API keys, no account, no orders. It only records:
 Markets and stations are discovered automatically from each contract's rules text, so new
 cities appear on their own and a station change on Kalshi's side shows up in the data.
 
-## Things learned while building this (worth knowing before Phase 2)
+## Things learned while building this
 
 - **Settlement source is The Weather Company** (weather.com/kalshi) reading the NWS station named
   in the rules (e.g. `CLINYC` = Central Park, `CLIMDW` = Chicago Midway, `CLIHOU` = Houston Hobby).
@@ -35,7 +36,8 @@ cities appear on their own and a station change on Kalshi's side shows up in the
 
 ```powershell
 cd C:\Users\iakog\project2026\isotherm
-pip install -r requirements.txt          # just `requests`
+pip install -r requirements.txt          # requests, numpy, pandas, scipy
+pip install -r requirements-dev.txt      # pytest; run: python -m pytest tests -q
 
 python -m isotherm run                   # run whichever jobs are due (what a scheduler would call)
 python -m isotherm run --force           # run every job now
@@ -43,17 +45,22 @@ python -m isotherm status                # health: row counts, last runs, Kalshi
 python -m isotherm peek KXHIGHNY-26OCT05 # one event: models, NBS baseline, market, raw share
 python -m isotherm backfill-cli 2015 2026      # historical observed highs/lows
 python -m isotherm backfill-outcomes --days 30 # recently settled Kalshi results
+python -m isotherm backfill-history --step all # Phase 2/3 history (resumable, hours)
+python -m isotherm backfill-history --step candles --retry-empty  # re-fetch empty price histories
+python -m isotherm evaluate              # Phase 2/3 report; freezes data/reports/blend.json once
+python -m isotherm paper-report          # score forward paper predictions
 ```
 
-Individual jobs: `discover`, `markets`, `forecasts`, `mos`, `settle`, `cli`.
+Individual jobs: `discover`, `markets`, `forecasts`, `mos`, `settle`, `cli`, `paper`.
 
 `run` is safe to call as often as you like. Each job has a minimum interval (`config.py`),
 forecasts are deduplicated by model run time, and a lock file prevents overlapping runs.
 
 ## Schedule
 
-Data only accumulates while something runs `python -m isotherm run` regularly, ideally hourly.
-Gaps are fine, since the computer being off just leaves holes. No scheduler is installed yet.
+The Windows scheduled task "Isotherm Logger" runs `python -m isotherm run` hourly at :07
+(`scripts/install_task.ps1`, `scripts/uninstall_task.ps1`). It only runs while the user is logged
+on and the PC is awake; gaps show up in `job_runs`, and missed paper decisions in `paper_decisions`.
 
 ## Data
 
@@ -61,14 +68,27 @@ Gaps are fine, since the computer being off just leaves holes. No scheduler is i
 
 Main tables: `markets`, `market_snapshots`, `ensemble_forecasts` (members as JSON),
 `deterministic_forecasts`, `mos_forecasts`, `outcomes`, `cli_reports`, `job_runs`.
+History for Phases 2/3: `hist_forecasts`, `market_candles`, `candles_done`.
+Paper trading: `paper_predictions`, `paper_decisions`. Reports: `data/reports/`.
+
+## Evaluation discipline
+
+- **DEV** (target dates before 2026-04-01): the market+model blend is fit on the earlier 70% of
+  dates and its trading threshold chosen on the latest 30%.
+- **VALIDATION** (2026-04-01 onward): reported at DEV-chosen settings. It was inspected while the
+  model was built, so it is *not* a clean holdout. Don't re-tune on it and report it again.
+- **FORWARD** (`paper_predictions`): the only clean test. Paper trading uses the frozen
+  `blend.json` and refuses one whose config hash doesn't match the code.
+- Uncertainty is clustered by calendar date; blend accuracy is also scored per event.
 
 ## Roadmap
 
-1. **Phase 1 (this):** collect for 8+ weeks. Don't trade.
-2. **Phase 2:** station-level bias correction + calibrated spread → bracket probabilities.
-   Must beat NBS on Brier/log score out-of-sample.
-3. **Phase 3:** score the market as a forecaster; paper-trade at the ask, after fees, frozen params.
-4. **Phase 4:** only if 2 and 3 pass. Tiny stakes, pre-written stop rules.
+1. **Phase 1 (done):** read-only logger.
+2. **Phase 2 (done):** station-level bias correction + calibrated Student-t spread → bracket
+   probabilities. Beats NBS on lows; about even on highs. The market beats both.
+3. **Phase 3 (in progress):** market+model blend, fee-aware backtest, then forward paper trading
+   with frozen settings and a stopping rule written in advance.
+4. **Phase 4:** only if 3 passes on forward data. Tiny stakes, pre-written stop rules.
 
 `peek` shows a raw ensemble share next to market prices for sanity checking only.
 It is uncalibrated and **not a trading signal**.
