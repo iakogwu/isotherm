@@ -69,6 +69,14 @@ The period only counts if all of these hold. Otherwise extend it.
 | **Pass, paper P&L 90% interval below or spanning 0** | The information is real but not tradable by taking the ask. Study resting limit orders using the order books captured at each decision (`order_books`) plus the trade history (`market_trades`). Use a conservative queue model: the order joins the back of its price level and fills only after trades at that price exhaust the size ahead, with no credit for cancellations. Report optimistic and pessimistic fill bounds. A new strategy needs its own frozen config and forward period. |
 | **Pass, paper P&L 90% interval above 0, at least 300 trades** | Eligible for Phase 4: a tiny live test (1 contract per qualifying event). This also needs the execution and risk controls from the 2026-10-04 review: exposure limits, daily loss cap, stale-data rejection, order reconciliation and a kill switch. |
 
+## Amendments
+
+- **2026-10-05, before any forward date settled:** the tested markets are frozen to the 48 daily
+  high/low series listed that day (24 cities; `paper.FORWARD_SERIES`). Cities Kalshi adds later
+  are logged but never paper-traded or counted, and the completeness denominator stays
+  48 × 2 per day. The frozen set equals the set already in use, so the 34 decisions recorded
+  before the change are unaffected, and the start date stays 2026-10-05.
+
 ## Known limits
 
 - **Season:** autumn into winter only. A pass does not prove the edge holds in summer.

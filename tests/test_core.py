@@ -349,6 +349,7 @@ def _forward_db(monkeypatch, start, n_dates, skip_decisions=0, sharp=False):
     import pandas as pd
     from isotherm import paper
     monkeypatch.setattr(paper, "FORWARD_START", start)
+    monkeypatch.setattr(paper, "FORWARD_SERIES", ("KXHIGHNY",))
     monkeypatch.setattr(paper, "_load_blend", lambda: ({"config_hash": "test"}, "ok"))
     con = _synthetic_contracts()
     dates = sorted(d for d in con["target_date"].unique() if d >= start)[:n_dates]
@@ -466,3 +467,16 @@ def test_backup_copies_verifies_and_keeps_seven(monkeypatch, tmp_path):
     copy.close()
     assert backup.run(src) == 1         # a second run the same day replaces today's copy
     assert len(list((tmp_path / "backups").glob("*"))) == 7
+
+
+def test_cities_added_after_the_freeze_are_not_paper_traded():
+    from datetime import datetime, timezone
+    from isotherm import paper
+    conn = _paper_db()   # KNYC / KXHIGHNY is in the frozen set
+    conn.execute("INSERT INTO stations(station_id, cli_code, tz) VALUES ('KXXX', 'CLIXXX', 'America/New_York')")
+    conn.execute("INSERT INTO series(series_ticker, kind, station_id) VALUES ('KXHIGHTNEW', 'high', 'KXXX')")
+    eve = features.decision_time("America/New_York", date(2026, 9, 1), "eve")
+    due = {st["station_id"] for st, d, hz, dec in paper._due(conn, eve.replace(minute=7))}
+    assert due == {"KNYC"}
+    assert paper._pending_kinds(conn, "KXXX", date(2026, 9, 1), "eve") == []
+    assert paper.completeness(conn, paper.FORWARD_START)[1] == 48 * 2   # denominator is frozen too

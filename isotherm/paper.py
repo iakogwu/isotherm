@@ -24,6 +24,24 @@ WINDOW_AFTER_DECISION = timedelta(hours=3)
 # later price under the original timestamp.
 QUOTE_MAX_LAG = timedelta(minutes=15)
 ENABLED = True    # on since 2026-10-04, with blend.json frozen from the validation run
+# The markets under forward test, frozen 2026-10-05: every daily high/low series Kalshi listed
+# then. Cities discover.py finds later are still logged but never paper-traded or counted,
+# so the tested set (and the completeness denominator) can't change mid-test.
+FORWARD_SERIES = (
+    "KXHIGHAUS", "KXHIGHCHI", "KXHIGHDEN", "KXHIGHLAX", "KXHIGHMIA", "KXHIGHNY", "KXHIGHPHIL",
+    "KXHIGHTATL", "KXHIGHTBOS", "KXHIGHTDAL", "KXHIGHTDC", "KXHIGHTEWR", "KXHIGHTHOU", "KXHIGHTLV",
+    "KXHIGHTMIN", "KXHIGHTNOLA", "KXHIGHTOKC", "KXHIGHTPHX", "KXHIGHTSAN", "KXHIGHTSATX",
+    "KXHIGHTSDF", "KXHIGHTSEA", "KXHIGHTSFO", "KXHIGHTTTN",
+    "KXLOWTATL", "KXLOWTAUS", "KXLOWTBOS", "KXLOWTCHI", "KXLOWTDAL", "KXLOWTDC", "KXLOWTDEN",
+    "KXLOWTEWR", "KXLOWTHOU", "KXLOWTLAX", "KXLOWTLV", "KXLOWTMIA", "KXLOWTMIN", "KXLOWTNOLA",
+    "KXLOWTNYC", "KXLOWTOKC", "KXLOWTPHIL", "KXLOWTPHX", "KXLOWTSAN", "KXLOWTSATX", "KXLOWTSDF",
+    "KXLOWTSEA", "KXLOWTSFO", "KXLOWTTTN",
+)
+
+
+def _in_forward(col="series_ticker") -> str:
+    """SQL filter to the frozen series (constants, so inlining them is safe)."""
+    return f"{col} IN ({', '.join(repr(t) for t in FORWARD_SERIES)})"
 
 
 def _load_blend():
@@ -43,7 +61,8 @@ def _load_blend():
 def _due(conn, now):
     out = []
     for st in conn.execute(
-            "SELECT * FROM stations WHERE station_id IN (SELECT station_id FROM series)").fetchall():
+            f"SELECT * FROM stations WHERE station_id IN (SELECT station_id FROM series WHERE {_in_forward()})"
+            ).fetchall():
         today = climate_today(st["tz"], now)
         for d in (today, today + timedelta(days=1)):
             for hz in features.HORIZONS:
@@ -56,7 +75,7 @@ def _due(conn, now):
 def _pending_kinds(conn, station_id, d, hz) -> list:
     """Kinds (high/low) at this station whose decision hasn't been logged yet."""
     return [r[0] for r in conn.execute(
-        """SELECT DISTINCT kind FROM series WHERE station_id=? AND kind NOT IN
+        f"""SELECT DISTINCT kind FROM series WHERE station_id=? AND {_in_forward()} AND kind NOT IN
                (SELECT kind FROM paper_decisions WHERE station_id=? AND target_date=? AND horizon=?)""",
         (station_id, station_id, d.isoformat(), hz))]
 
@@ -99,9 +118,9 @@ def _record(conn, st, d, hz, dec, kinds, blend) -> int:
     ds = model.build_dataset(conn, hz, st["station_id"])
     pr = model.fit_predict(ds, only_dates=[d.isoformat()])
     mk = pd.read_sql_query(
-        """SELECT m.ticker, m.event_ticker, m.strike_type, m.floor_strike, m.cap_strike, s.kind
+        f"""SELECT m.ticker, m.event_ticker, m.strike_type, m.floor_strike, m.cap_strike, s.kind
            FROM markets m JOIN series s USING(series_ticker)
-           WHERE s.station_id=? AND m.target_date=?""",
+           WHERE s.station_id=? AND m.target_date=? AND {_in_forward("s.series_ticker")}""",
         conn, params=(st["station_id"], d.isoformat()))
     quotes = _quotes_at(conn, st["station_id"], d, dec)
     mk = mk.merge(quotes, on="ticker", how="left") if not quotes.empty else mk.assign(
@@ -212,7 +231,7 @@ def _settled(conn) -> pd.DataFrame:
 def completeness(conn, through: str) -> tuple:
     """(recorded share, expected count) of decisions for target dates FORWARD_START..through.
     Expected = every series x horizon x day, so a PC that was off (no row at all) counts as missed."""
-    n_series = conn.execute("SELECT COUNT(*) FROM series").fetchone()[0]
+    n_series = len(FORWARD_SERIES)
     days = (pd.Timestamp(through) - pd.Timestamp(FORWARD_START)).days + 1
     expected = max(days, 0) * n_series * len(features.HORIZONS)
     recorded = conn.execute(
